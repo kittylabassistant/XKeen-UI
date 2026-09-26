@@ -102,7 +102,7 @@ async function resolveProxyChain(
   const chain = [name]
   const visited = new Set([name])
   let current = name
-  for (;;) {
+  for (; ;) {
     if (signal.aborted) break
     let info = cache.get(current)
     if (info === undefined) {
@@ -138,7 +138,7 @@ function ResultRow({
     <div className="border-border bg-card rounded-lg border p-3 text-[13px]">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span className="truncate font-mono" title={result.target}>
+          <span className="truncate" title={result.target}>
             {result.target}
           </span>
           <span className="text-muted-foreground shrink-0 text-[11px] tracking-wide uppercase">
@@ -189,7 +189,7 @@ function ResultRow({
 
       {result.resolvedIps.length > 0 && (
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs">
-          <span className="font-mono">{result.resolvedIps.join(', ')}</span>
+          <span >{result.resolvedIps.join(', ')}</span>
           {result.dnsSource && (
             <Badge variant="outline" className="h-4.5 rounded-sm px-1.5 text-[10px]">
               {DNS_SOURCE_LABELS[result.dnsSource] ?? result.dnsSource}
@@ -383,19 +383,19 @@ export function RouteTesterModal() {
     if (uniqueOutbounds.length === 0) return
     const controller = new AbortController()
     const cache = new Map<string, ProxyLite | null>()
-    ;(async () => {
-      const entries = await Promise.all(
-        uniqueOutbounds.map(
-          async (name) =>
-            [
-              name,
-              await resolveProxyChain(clashApiPort ?? '', clashApiSecret, clashApiUnix ?? null, cache, name, controller.signal),
-            ] as const
+      ; (async () => {
+        const entries = await Promise.all(
+          uniqueOutbounds.map(
+            async (name) =>
+              [
+                name,
+                await resolveProxyChain(clashApiPort ?? '', clashApiSecret, clashApiUnix ?? null, cache, name, controller.signal),
+              ] as const
+          )
         )
-      )
-      if (controller.signal.aborted) return
-      setChains(Object.fromEntries(entries.filter(([, chain]) => chain.length > 1)))
-    })()
+        if (controller.signal.aborted) return
+        setChains(Object.fromEntries(entries.filter(([, chain]) => chain.length > 1)))
+      })()
     return () => {
       controller.abort()
     }
@@ -465,7 +465,7 @@ export function RouteTesterModal() {
               }}
               placeholder={'Цель на строку, например:\nyoutube.com\n1.1.1.1\nhttps://example.com:8443/path'}
               aria-label="Список целей для проверки маршрута"
-              className="min-h-24 resize-y font-mono text-xs"
+              className="min-h-24 resize-y text-[13px]!"
             />
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className={cn('text-muted-foreground text-xs', overLimit && 'text-destructive')}>
