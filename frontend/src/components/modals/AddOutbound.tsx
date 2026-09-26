@@ -477,11 +477,11 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
   const trimmedSubName = subForm?.name.trim() ?? ''
   const providerNameConflict = Boolean(
     isMihomoProviderFlow &&
-      renameRefs &&
-      replaceTarget !== null &&
-      subForm !== null &&
-      trimmedSubName !== replaceTarget &&
-      providerNames.includes(trimmedSubName)
+    renameRefs &&
+    replaceTarget !== null &&
+    subForm !== null &&
+    trimmedSubName !== replaceTarget &&
+    providerNames.includes(trimmedSubName)
   )
   const providerReplaceDisabled = !replaceTarget || newProviderName === null || providerNameConflict || !trimmedSubName
 
@@ -775,7 +775,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
                       className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
                       onClick={toggleReplace}
                     >
-                      <IconReplace /> <span className="truncate">Заменить…</span>
+                      <IconReplace /> <span className="truncate">Заменить</span>
                     </Button>
                   )}
                 </div>
@@ -787,7 +787,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
                     value={replaceTarget}
                     onValueChange={selectReplaceTarget}
                     placeholder="Выберите провайдера"
-                    emptyHint="В config.yaml нет провайдеров"
+                    emptyHint="Массив proxy-providers в конфиге не найден"
                     renameRefs={renameRefs}
                     onRenameRefsChange={setRenameRefs}
                     description={
@@ -866,7 +866,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
                       className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
                       onClick={toggleReplace}
                     >
-                      <IconReplace /> <span className="truncate">Заменить…</span>
+                      <IconReplace /> <span className="truncate">Заменить</span>
                     </Button>
                   )}
                 </div>
@@ -878,7 +878,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
                     value={replaceTarget}
                     onValueChange={selectReplaceTarget}
                     placeholder="Выберите прокси"
-                    emptyHint="В config.yaml нет прокси"
+                    emptyHint="Массив proxies в конфиге не найден"
                     renameRefs={renameRefs}
                     onRenameRefsChange={setRenameRefs}
                     description={
