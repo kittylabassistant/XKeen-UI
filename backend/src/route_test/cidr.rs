@@ -13,6 +13,15 @@ pub(crate) struct Cidr {
     pub(crate) bits: u8,
 }
 
+/// Границы сети (включительно, замаскированные по `bits`) одного семейства адресов — используется
+/// `route_test::providers` для построения компактного отсортированного индекса диапазонов вместо
+/// линейного перебора `Vec<(Cidr, String)>` для больших ipcidr rule-provider'ов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Range {
+    V4(u32, u32),
+    V6(u128, u128),
+}
+
 impl Cidr {
     /// mihomo-семантика: явный `/bits` обязателен (`netip.ParsePrefix` не принимает голый IP) —
     /// используется и для правил `IP-CIDR`/`IP-CIDR6`/`IP-SUFFIX` (плюс их `SRC-*`-варианты), и для
@@ -60,6 +69,25 @@ impl Cidr {
                 (u128::from(n) & mask) == (u128::from(i) & mask)
             }
             _ => false,
+        }
+    }
+
+    /// То же маскирование, что и `contains`, но отдаёт получившиеся границы диапазона напрямую —
+    /// не только точку сравнения. `net` может быть незамаскированным адресом хоста (mihomo это
+    /// допускает, см. doc-комментарий `from_parts`), поэтому обе границы считаются через маску,
+    /// а не просто `(net, net | !mask)`.
+    pub(crate) fn to_range(self) -> Range {
+        match self.net {
+            IpAddr::V4(n) => {
+                let mask = u32::MAX.checked_shl(32 - self.bits as u32).unwrap_or(0);
+                let base = u32::from(n) & mask;
+                Range::V4(base, base | !mask)
+            }
+            IpAddr::V6(n) => {
+                let mask = u128::MAX.checked_shl(128 - self.bits as u32).unwrap_or(0);
+                let base = u128::from(n) & mask;
+                Range::V6(base, base | !mask)
+            }
         }
     }
 }
@@ -121,5 +149,32 @@ mod tests {
         let v4 = Cidr::parse("192.168.1.0/24").unwrap();
         assert!(v4.contains("192.168.1.255".parse().unwrap()));
         assert!(!v4.contains("192.168.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn to_range_masks_host_bits_of_unaligned_address() {
+        let v4 = Cidr::parse("192.168.1.5/24").unwrap();
+        assert_eq!(
+            v4.to_range(),
+            Range::V4(
+                u32::from(std::net::Ipv4Addr::new(192, 168, 1, 0)),
+                u32::from(std::net::Ipv4Addr::new(192, 168, 1, 255))
+            )
+        );
+    }
+
+    #[test]
+    fn to_range_zero_bits_covers_whole_family() {
+        let v4 = Cidr::parse("0.0.0.0/0").unwrap();
+        assert_eq!(v4.to_range(), Range::V4(0, u32::MAX));
+        let v6 = Cidr::parse("::/0").unwrap();
+        assert_eq!(v6.to_range(), Range::V6(0, u128::MAX));
+    }
+
+    #[test]
+    fn to_range_full_bits_is_single_address() {
+        let v6 = Cidr::parse("2001:db8::1/128").unwrap();
+        let addr = u128::from("2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(v6.to_range(), Range::V6(addr, addr));
     }
 }
