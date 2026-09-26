@@ -9,9 +9,9 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
-import { IconAlertTriangle, IconArrowRight, IconChevronDown, IconFileUpload, IconRoute, IconX } from '@tabler/icons-react'
+import { IconAlertTriangle, IconChevronDown, IconFileUpload, IconRoute, IconX } from '@tabler/icons-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { apiCall, buildClashHeaders, capitalize, clashFetch } from '../../lib/api'
+import { apiCall, buildClashHeaders, capitalize } from '../../lib/api'
 import { useAppContext, useModalContext } from '../../lib/store'
 import { cn } from '../../lib/utils'
 
@@ -64,11 +64,6 @@ interface RouteTestRunResponse {
   warnings?: string[]
 }
 
-interface ProxyLite {
-  type?: string
-  now?: string
-}
-
 const MAX_TARGETS = 500
 const NO_INBOUND = '__none__'
 const KIND_LABELS: Record<string, string> = { domain: 'домен', ip: 'ip' }
@@ -91,47 +86,7 @@ function pluralizeTargets(n: number): string {
   return 'целей'
 }
 
-async function resolveProxyChain(
-  port: string,
-  secret: string | null,
-  unix: string | null,
-  cache: Map<string, ProxyLite | null>,
-  name: string,
-  signal: AbortSignal
-): Promise<string[]> {
-  const chain = [name]
-  const visited = new Set([name])
-  let current = name
-  for (; ;) {
-    if (signal.aborted) break
-    let info = cache.get(current)
-    if (info === undefined) {
-      try {
-        info = await clashFetch<ProxyLite>(port, `proxies/${encodeURIComponent(current)}`, { secret, unix, retry: false, signal })
-      } catch {
-        info = null
-      }
-      cache.set(current, info)
-    }
-    if (!info?.now || visited.has(info.now)) break
-    chain.push(info.now)
-    visited.add(info.now)
-    current = info.now
-  }
-  return chain
-}
-
-function ResultRow({
-  result,
-  chain,
-  expanded,
-  onToggle,
-}: {
-  result: RouteTestResult
-  chain?: string[]
-  expanded: boolean
-  onToggle: () => void
-}) {
+function ResultRow({ result, expanded, onToggle }: { result: RouteTestResult; expanded: boolean; onToggle: () => void }) {
   const hasDetails = result.skipped.length > 0 || !!result.error
 
   return (
@@ -152,17 +107,6 @@ function ResultRow({
           {result.outcome === 'error' ? 'Ошибка' : (result.outbound ?? '—')}
         </Badge>
       </div>
-
-      {chain && chain.length > 1 && (
-        <div className="text-muted-foreground mt-1.5 flex flex-wrap items-center gap-1 text-xs">
-          {chain.map((name, i) => (
-            <span key={`${name}-${i}`} className="flex items-center gap-1">
-              {i > 0 && <IconArrowRight size={11} className="shrink-0" />}
-              <span className="truncate">{name}</span>
-            </span>
-          ))}
-        </div>
-      )}
 
       {result.outcome !== 'error' && (
         <div
@@ -241,7 +185,6 @@ export function RouteTesterModal() {
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<RouteTestResult[] | null>(null)
   const [warnings, setWarnings] = useState<string[]>([])
-  const [chains, setChains] = useState<Record<string, string[]>>({})
   const [filter, setFilter] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
@@ -325,7 +268,6 @@ export function RouteTesterModal() {
     setRunning(true)
     setResults(null)
     setWarnings([])
-    setChains({})
     setFilter(null)
     setExpanded(new Set())
     const controller = new AbortController()
@@ -376,30 +318,6 @@ export function RouteTesterModal() {
   function cancelRun() {
     abortRef.current?.abort()
   }
-
-  useEffect(() => {
-    if (!modals.showRouteTestModal || !results || core !== 'mihomo' || !(clashApiPort || clashApiUnix)) return
-    const uniqueOutbounds = Array.from(new Set(results.filter((r) => r.outbound).map((r) => r.outbound as string)))
-    if (uniqueOutbounds.length === 0) return
-    const controller = new AbortController()
-    const cache = new Map<string, ProxyLite | null>()
-      ; (async () => {
-        const entries = await Promise.all(
-          uniqueOutbounds.map(
-            async (name) =>
-              [
-                name,
-                await resolveProxyChain(clashApiPort ?? '', clashApiSecret, clashApiUnix ?? null, cache, name, controller.signal),
-              ] as const
-          )
-        )
-        if (controller.signal.aborted) return
-        setChains(Object.fromEntries(entries.filter(([, chain]) => chain.length > 1)))
-      })()
-    return () => {
-      controller.abort()
-    }
-  }, [results, core, clashApiPort, clashApiSecret, clashApiUnix, modals.showRouteTestModal])
 
   const chipEntries = useMemo(() => {
     if (!results) return []
@@ -610,13 +528,7 @@ export function RouteTesterModal() {
                   <div className="text-muted-foreground flex h-20 items-center justify-center text-xs">Нет результатов</div>
                 ) : (
                   filteredResults.map((r) => (
-                    <ResultRow
-                      key={r.target}
-                      result={r}
-                      chain={r.outbound ? chains[r.outbound] : undefined}
-                      expanded={expanded.has(r.target)}
-                      onToggle={() => toggleExpanded(r.target)}
-                    />
+                    <ResultRow key={r.target} result={r} expanded={expanded.has(r.target)} onToggle={() => toggleExpanded(r.target)} />
                   ))
                 )}
               </div>

@@ -35,9 +35,9 @@ export function buildClashHeaders(port?: string | null, secret?: string | null, 
 export async function clashFetch<T = unknown>(
   port: string,
   path: string,
-  options?: { method?: string; secret?: string | null; body?: unknown; unix?: string | null; retry?: boolean; signal?: AbortSignal }
+  options?: { method?: string; secret?: string | null; body?: unknown; unix?: string | null; retry?: boolean }
 ): Promise<T> {
-  const { method = 'GET', secret, body, unix, retry = true, signal } = options ?? {}
+  const { method = 'GET', secret, body, unix, retry = true } = options ?? {}
   const canRetry = retry && method === 'GET'
   const normalizedPath = path.replace(/^\/+/, '')
 
@@ -48,7 +48,6 @@ export async function clashFetch<T = unknown>(
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
-    signal,
   }
 
   const maxAttempts = canRetry ? RETRY_DELAYS.length : 0
