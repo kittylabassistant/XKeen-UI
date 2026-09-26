@@ -17,7 +17,8 @@ use std::sync::Mutex;
 use yaml_rust2::Yaml;
 
 /// Результат сравнения одного правила: сработало / не сработало / нельзя определить (нет данных —
-/// IP источника, процесс, geo-файл и т.п.). Дизайн трёхзначной логики — `tasks/route-tester-spec.md`.
+/// IP источника, geo-файл и т.п.). Дизайн трёхзначной логики — `tasks/route-tester-spec.md`.
+/// `PROCESS-*`/`UID` НЕ входят в «нельзя определить» — см. `RuleKind::NoMatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Match,
@@ -105,6 +106,21 @@ pub(crate) enum RuleKind {
     Or(Vec<RuleKind>),
     Not(Box<RuleKind>),
     Match,
+    /// Безусловный `NoMatch` (не `Unknown`) — для `PROCESS-NAME`/`-PATH` и `UID`: тестер симулирует
+    /// соединение LAN-клиента, перехваченное tproxy/redir-инбаундом, а не открытое локальным
+    /// процессом роутера, поэтому `metadata.Process`/`ProcessPath`/`Uid` в mihomo гарантированно
+    /// пустые/нулевые вне зависимости от `find-process-mode` (`off` — `helper.FindProcess` вообще
+    /// `nil`, `tunnel/tunnel.go`; `strict`/`always` — вызывается, но `component/process` ищет сокет
+    /// по netlink INET_DIAG, ключуясь на *локальный* адрес, а у tproxy/redir-соединения локальный
+    /// адрес сокета это исходный dst, а не IP LAN-клиента — владелец не находится никогда).
+    /// `rules/common/process.go::Match` при этом не делает `return false` на пустой target, а
+    /// сравнивает буквально: `PROCESS-NAME`/`-PATH` -> `EqualFold("", payload)` — всегда false,
+    /// т.к. payload не может быть пустым (`rules/parser.go`). `rules/common/uid.go::Match` гасит
+    /// сравнение до чтения диапазона: `metadata.Uid != 0` — тоже всегда false. Для
+    /// `PROCESS-*-REGEX`/`-WILDCARD` результат зависит от паттерна (регэксп/wildcard, матчащий
+    /// пустую строку, реально даёт `Match`) — такие узлы не используют этот вариант, а сворачиваются
+    /// в `Match`/`NoMatch` уже при разборе (см. `build_rule_kind`).
+    NoMatch,
     Unknown(String),
 }
 
@@ -236,6 +252,12 @@ pub(crate) fn parse_predicate(line: &str) -> Result<RuleKind, String> {
     Ok(build_rule_kind(&tp, &payload, &params))
 }
 
+/// Для узлов, чей исход не зависит от цели (напр. `PROCESS-*-REGEX`/`-WILDCARD` против всегда
+/// пустого `metadata.Process`/`ProcessPath`) — сворачиваем результат сразу при разборе правила.
+fn rule_kind_from_bool(b: bool) -> RuleKind {
+    if b { RuleKind::Match } else { RuleKind::NoMatch }
+}
+
 fn build_rule_kind(tp: &str, payload: &str, params: &[String]) -> RuleKind {
     match tp {
         "DOMAIN" => RuleKind::Domain(payload.to_lowercase()),
@@ -326,18 +348,41 @@ fn build_rule_kind(tp: &str, payload: &str, params: &[String]) -> RuleKind {
             RuleKind::Unknown("недоступно вне реального соединения".into())
         }
         "DSCP" => RuleKind::Unknown("DSCP недоступен для тестера маршрутов".into()),
-        "PROCESS-NAME"
-        | "PROCESS-PATH"
-        | "PROCESS-NAME-REGEX"
-        | "PROCESS-PATH-REGEX"
-        | "PROCESS-NAME-WILDCARD"
-        | "PROCESS-PATH-WILDCARD" => RuleKind::Unknown("нужна информация о процессе".into()),
+        // Тестер симулирует пересылаемый через роутер LAN-трафик: владельца сокета найти нельзя
+        // ни в одном режиме find-process-mode (см. `RuleKind::NoMatch`) -> `metadata.Process`/
+        // `ProcessPath` в mihomo остаются "" на всё время матчинга (rules/common/process.go,
+        // `Match`: `helper.FindProcess()` вызывается, но при провале просто не трогает metadata).
+        // `Match` НЕ делает `return false` на пустой target — сравнивает/матчит буквально как есть:
+        //   case ProcessName/ProcessPath: `strings.EqualFold(target, ps.pattern)`. payload не может
+        //   быть пустым (`rules/parser.go`: `if tp != "MATCH" && payload == "" { error }`), значит
+        //   `EqualFold("", непустой_payload)` — всегда false -> детерминированный NoMatch.
+        "PROCESS-NAME" | "PROCESS-PATH" => RuleKind::NoMatch,
+        //   case ProcessNameRegex/ProcessPathRegex: `ps.regexp.MatchString(target)` — обычный матч
+        //   по пустой строке, результат зависит от паттерна (`.*` матчит "", `^discord$` — нет).
+        //   Раз target зафиксирован как "" для всего прогона тестера, можно посчитать это один раз
+        //   при разборе правила и сразу свернуть узел в `Match`/`NoMatch` (regexp2.IgnoreCase на
+        //   исход матча с "" не влияет, но компилируем с ним же ради консистентности с mihomo).
+        "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX" => {
+            match RegexBuilder::new(payload).case_insensitive(true).build() {
+                Ok(re) => rule_kind_from_bool(re.is_match("")),
+                Err(e) => RuleKind::Unknown(format!("неверное регулярное выражение: {e}")),
+            }
+        }
+        //   case ProcessNameWildcard/ProcessPathWildcard: `wildcard.Match(strings.ToLower(pattern),
+        //   strings.ToLower(target))` — та же `component/wildcard.Match`, что и у DOMAIN-WILDCARD
+        //   (rules/common/domain_wildcard.go), уже реализована как `glob_match` в этом файле.
+        //   `wildcard.Match("*", "")` возвращает true, поэтому чисто "*" реально матчит.
+        "PROCESS-NAME-WILDCARD" | "PROCESS-PATH-WILDCARD" => {
+            rule_kind_from_bool(glob_match(&payload.to_lowercase(), ""))
+        }
         "NETWORK" => match payload.to_uppercase().as_str() {
             "TCP" => RuleKind::Network(Network::Tcp),
             "UDP" => RuleKind::Network(Network::Udp),
             _ => RuleKind::Unknown(format!("неизвестный тип сети: {payload}")),
         },
-        "UID" => RuleKind::Unknown("UID недоступен для тестера маршрутов".into()),
+        // Как и PROCESS-*: metadata.Uid остаётся 0 (сокет LAN-клиента не принадлежит роутеру) ->
+        // `Uid.Match` в mihomo падает в `metadata.Uid != 0 == false` -> NoMatch.
+        "UID" => RuleKind::NoMatch,
         "REMATCH-NAME" => RuleKind::Unknown("REMATCH-NAME недоступен для тестера маршрутов".into()),
         "SUB-RULE" => RuleKind::Unknown("SUB-RULE не поддерживается".into()),
         "RULE-SET" => {
@@ -727,6 +772,7 @@ pub(crate) fn eval_predicate<'a, R: Resolver>(
         match node {
             RuleKind::Unknown(reason) => Verdict::Unknown(reason.clone()),
             RuleKind::Match => Verdict::Match,
+            RuleKind::NoMatch => Verdict::NoMatch,
             RuleKind::Domain(d) => bool_verdict(eval.domain_target == Some(d.as_str())),
             RuleKind::DomainSuffix(s) => bool_verdict(
                 eval.domain_target
@@ -1622,5 +1668,202 @@ rules:
         assert!(glob_match("*.example.com", "a.b.example.com"));
         assert!(glob_match("a?c.com", "abc.com"));
         assert!(!glob_match("a?c.com", "abcd.com"));
+    }
+
+    /// Формат портов как у `utils.NewUnsignedRanges` (`rules/common/port.go` делегирует туда):
+    /// `,` и `/` — взаимозаменяемые разделители списка, `N-M` — диапазон.
+    #[test]
+    fn port_ranges_parses_slash_separated_lists_and_ranges() {
+        let list = PortRanges::parse("2053/2083/2087/2096/8443").unwrap();
+        assert!(list.check(2053));
+        assert!(list.check(8443));
+        assert!(!list.check(443));
+        assert!(!list.check(2054));
+
+        let ranges = PortRanges::parse("19200-19400/50000-50100").unwrap();
+        assert!(ranges.check(19333));
+        assert!(ranges.check(50100));
+        assert!(!ranges.check(19199));
+        assert!(!ranges.check(50101));
+    }
+
+    /// Мейнтейнерский сценарий: `discord@classical` из 8 строк, одна из них
+    /// `PROCESS-NAME-REGEX` — не должна давать `Unknown` и засорять "Пропущено правил" для
+    /// посторонней цели (google.com), но должна корректно матчить discord.com и UDP-диапазон.
+    #[tokio::test]
+    async fn classical_process_regex_line_does_not_poison_unrelated_targets() {
+        let dir = std::env::temp_dir().join(format!("route-tester-mihomo-discord-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(dir.join("rules")).await.unwrap();
+        write(
+            &dir.join("rules"),
+            &format!("{:x}", md5::compute("https://example.com/discord-classical.txt")),
+            concat!(
+                "PROCESS-NAME-REGEX,^([Dd]iscord(\\.exe)?|com\\.discord)$\n",
+                "AND,((DOMAIN-KEYWORD,discord),(NOT,((DOMAIN-SUFFIX,ru))))\n",
+                "AND,((RULE-SET,x@ipcidr,no-resolve),(NETWORK,TCP),(DST-PORT,2053/2083/2087/2096/8443))\n",
+                "AND,((IP-CIDR,5.200.14.128/25,no-resolve),(NETWORK,UDP),(DST-PORT,19200-19400/50000-50100))\n",
+                "DOMAIN-SUFFIX,discord.gg\n",
+                "DOMAIN-SUFFIX,discordapp.com\n",
+                "DOMAIN-SUFFIX,discordapp.net\n",
+                "DOMAIN-SUFFIX,discord.media\n",
+            ),
+        )
+        .await;
+        write(
+            &dir.join("rules"),
+            &format!("{:x}", md5::compute("https://example.com/x-ipcidr.txt")),
+            "1.1.1.0/24\n",
+        )
+        .await;
+        let yaml = r#"
+rule-providers:
+  discord@classical: {type: http, format: text, behavior: classical, url: https://example.com/discord-classical.txt}
+  x@ipcidr: {type: http, format: text, behavior: ipcidr, url: https://example.com/x-ipcidr.txt}
+rules:
+  - "RULE-SET,discord@classical,Discord"
+  - "MATCH,Proxy"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+
+        // Посторонняя цель: PROCESS-NAME-REGEX -> NoMatch, а не Unknown -> вся OR-цепочка
+        // classical-провайдера NoMatch -> уходим до MATCH,Proxy, "Пропущено правил" пусто.
+        let res = engine.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("Proxy"));
+        assert!(
+            res.skipped.is_empty(),
+            "google.com не должен ничего пропускать: {:?}",
+            res.skipped
+        );
+
+        // discord.com матчится веткой AND(DOMAIN-KEYWORD,NOT(DOMAIN-SUFFIX,ru)).
+        let res = engine.evaluate(&ctx_domain("discord.com"), &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("Discord"));
+        assert!(res.skipped.is_empty());
+
+        // IP в UDP-диапазоне из последней AND-ветки.
+        let ctx = Ctx {
+            target: super::super::Target::Ip("5.200.14.200".parse().unwrap()),
+            port: 19333,
+            network: Net::Udp,
+            source_ip: None,
+            inbound_tag: None,
+        };
+        let res = engine.evaluate(&ctx, &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("Discord"));
+        assert!(res.skipped.is_empty());
+    }
+
+    /// `PROCESS-NAME`/`UID` на верхнем уровне — NoMatch, а не Unknown: правило просто не
+    /// срабатывает и не попадает в "Пропущено правил".
+    #[tokio::test]
+    async fn top_level_process_and_uid_rules_are_nomatch_not_skipped() {
+        let dir = std::env::temp_dir().join(format!("route-tester-mihomo-proc-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+rules:
+  - "PROCESS-NAME,foo,DIRECT"
+  - "PROCESS-NAME-REGEX,^foo$,DIRECT"
+  - "PROCESS-PATH,/usr/bin/foo,DIRECT"
+  - "PROCESS-PATH-REGEX,^/usr/bin/foo$,DIRECT"
+  - "UID,1000-2000,DIRECT"
+  - "MATCH,Proxy"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+        let res = engine.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("Proxy"));
+        assert_eq!(res.rule.unwrap().index, 5);
+        assert!(
+            res.skipped.is_empty(),
+            "PROCESS-*/UID не должны попадать в skipped: {:?}",
+            res.skipped
+        );
+    }
+
+    /// `OR(PROCESS-NAME, DOMAIN-SUFFIX)` — ровно мейнтейнерский баг: раньше `Unknown` из
+    /// PROCESS-NAME "побеждал" `NoMatch` от DOMAIN-SUFFIX и всё правило шло в skipped.
+    #[tokio::test]
+    async fn or_with_process_rule_and_nomatch_sibling_is_nomatch_not_unknown() {
+        let dir = std::env::temp_dir().join(format!("route-tester-mihomo-or-proc-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+rules:
+  - "OR,((PROCESS-NAME,foo),(DOMAIN-SUFFIX,x.com)),Proxy"
+  - "MATCH,DIRECT"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+        let res = engine.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("DIRECT"));
+        assert!(res.skipped.is_empty());
+    }
+
+    /// `NOT(PROCESS-NAME)` инвертирует детерминированный NoMatch в Match — тоже без Unknown.
+    #[tokio::test]
+    async fn not_process_rule_inverts_nomatch_to_match() {
+        let dir = std::env::temp_dir().join(format!("route-tester-mihomo-not-proc-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+rules:
+  - "NOT,((PROCESS-NAME,foo)),Proxy"
+  - "MATCH,DIRECT"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+        let res = engine.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("Proxy"));
+        assert!(res.skipped.is_empty());
+    }
+
+    /// `PROCESS-*-REGEX`/`-WILDCARD` не сворачиваются в безусловный NoMatch: mihomo сравнивает
+    /// паттерн с пустым `metadata.Process` буквально (`rules/common/process.go::Match`, без
+    /// раннего `return false`), поэтому паттерн, матчащий пустую строку (`.*`, `*`), реально
+    /// даёт `Match`. `component/wildcard.Match("*", "")` -> `true` (тот же код, что у
+    /// DOMAIN-WILDCARD), обычный regex-движок аналогично матчит `.*` на "".
+    #[tokio::test]
+    async fn process_regex_and_wildcard_are_evaluated_against_empty_process_name() {
+        let dir = std::env::temp_dir().join(format!("route-tester-mihomo-proc-re-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+rules:
+  - "PROCESS-NAME-REGEX,.*,MatchAll"
+  - "PROCESS-NAME-REGEX,^discord$,NoMatchDiscord"
+  - "PROCESS-NAME-WILDCARD,*,MatchStar"
+  - "PROCESS-NAME-WILDCARD,dis*,NoMatchDisStar"
+  - "MATCH,Proxy"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+
+        // "PROCESS-NAME-REGEX,.*" матчит пустую строку -> первое правило само срабатывает.
+        let res = engine.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        assert_eq!(res.outbound.as_deref(), Some("MatchAll"));
+        assert!(res.skipped.is_empty());
+
+        // Без правила ".*" (изолированно): "^discord$" не матчит "" -> NoMatch, не Unknown.
+        let dir2 = std::env::temp_dir().join(format!("route-tester-mihomo-proc-re2-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir2).await.unwrap();
+        let yaml2 = r#"
+rules:
+  - "PROCESS-NAME-REGEX,^discord$,NoMatchDiscord"
+  - "PROCESS-NAME-WILDCARD,*,MatchStar"
+  - "PROCESS-NAME-WILDCARD,dis*,NoMatchDisStar"
+  - "MATCH,Proxy"
+"#;
+        let engine2 = from_yaml_str(yaml2, &dir2).await.unwrap();
+        let res2 = engine2.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        // "^discord$" -> NoMatch, следующее правило "PROCESS-NAME-WILDCARD,*" матчит "" -> "MatchStar".
+        assert_eq!(res2.outbound.as_deref(), Some("MatchStar"));
+        assert!(res2.skipped.is_empty());
+
+        // Изолируем "dis*" отдельно от "*", чтобы доказать, что оно само по себе NoMatch.
+        let dir3 = std::env::temp_dir().join(format!("route-tester-mihomo-proc-re3-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir3).await.unwrap();
+        let yaml3 = r#"
+rules:
+  - "PROCESS-NAME-REGEX,^discord$,NoMatchDiscord"
+  - "PROCESS-NAME-WILDCARD,dis*,NoMatchDisStar"
+  - "MATCH,Proxy"
+"#;
+        let engine3 = from_yaml_str(yaml3, &dir3).await.unwrap();
+        let res3 = engine3.evaluate(&ctx_domain("google.com"), &empty_resolver()).await;
+        assert_eq!(res3.outbound.as_deref(), Some("Proxy"));
+        assert!(res3.skipped.is_empty());
     }
 }
