@@ -322,7 +322,7 @@ export function StatusBar({
               <Tooltip>
                 <TooltipTrigger
                   render={
-                    <Button variant="outline" onClick={onOpenCoreManage}>
+                    <Button variant="outline" onClick={onOpenCoreManage} disabled={isPending}>
                       <IconCpu data-icon="inline-start" className="size-4.5" />
                       <span className="text-[13px]">{capitalize(currentCore)}</span>
                       {coreVersions[currentCore] && (
@@ -349,6 +349,7 @@ export function StatusBar({
                     <Button
                       variant="outline"
                       onClick={() => onOpenUpdate('self')}
+                      disabled={isPending}
                       className={cn(
                         'relative overflow-hidden text-xs tracking-wider',
                         isOutdatedUI ? 'border-none! text-cyan-300 hover:text-cyan-300' : ''
