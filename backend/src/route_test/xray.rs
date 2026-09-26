@@ -262,6 +262,8 @@ struct RawBalancer {
     tag: String,
     #[serde(default, rename = "selector")]
     selector: StringList,
+    #[serde(default, rename = "fallbackTag")]
+    fallback_tag: String,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -1087,7 +1089,13 @@ pub struct Engine {
     outbounds_first: Option<String>,
     inbound_tags_list: Vec<String>,
     domain_strategy: DomainStrategy,
-    balancer_selectors: std::collections::HashMap<String, Vec<String>>,
+    /// Тег балансировщика → теги outbound'ов, реально подпадающие под его `selector` (селекторы —
+    /// ПРЕФИКСЫ тегов outbound'ов, не сами теги целиком: `app/proxyman/outbound/outbound.go`,
+    /// `Manager.Select` — `strings.HasPrefix(tag, selector)` по всем зарегистрированным хендлерам,
+    /// результат `sort.Strings`'ится — то есть итог детерминирован по алфавиту тегов, а не по
+    /// порядку `outbounds` в конфиге и не по порядку селекторов). Считается один раз при загрузке
+    /// конфига (теги outbound'ов и селекторы уже все известны), не на каждый `evaluate()`.
+    balancer_members: std::collections::HashMap<String, Vec<String>>,
     rules: Vec<CompiledRule>,
     load_warnings: Vec<String>,
     runtime_warnings: Mutex<Vec<String>>,
@@ -1116,6 +1124,14 @@ impl Engine {
 
         let outbounds_first = merged.outbounds.first().map(|o| o.tag.clone());
 
+        let mut outbound_tags = Vec::new();
+        let mut seen_ob = HashSet::new();
+        for ob in &merged.outbounds {
+            if !ob.tag.is_empty() && seen_ob.insert(ob.tag.clone()) {
+                outbound_tags.push(ob.tag.clone());
+            }
+        }
+
         let mut inbound_tags_list = Vec::new();
         let mut seen = HashSet::new();
         for ib in &merged.inbounds {
@@ -1126,11 +1142,36 @@ impl Engine {
 
         let routing = merged.routing.unwrap_or_default();
         let domain_strategy = DomainStrategy::parse(routing.domain_strategy.as_deref());
-        let balancer_selectors = routing
-            .balancers
-            .iter()
-            .map(|b| (b.tag.clone(), b.selector.0.clone()))
-            .collect();
+
+        // `Manager.Select` (см. комментарий на поле `Engine::balancer_members`): каждый селектор —
+        // префикс, матчащий 0+ тегов outbound'ов; итог по балансировщику — объединение по всем его
+        // селекторам, без дублей, отсортированное (`BTreeSet` даёт то же упорядочивание, что и
+        // `sort.Strings` в оригинале — побайтовое сравнение строк).
+        let mut balancer_members: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for b in &routing.balancers {
+            let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for sel in &b.selector.0 {
+                let hits: Vec<&String> = outbound_tags.iter().filter(|t| t.starts_with(sel.as_str())).collect();
+                if hits.is_empty() {
+                    warnings.push(format!(
+                        "балансировщик {}: селектор {sel} не совпал ни с одним outbound",
+                        b.tag
+                    ));
+                } else {
+                    members.extend(hits.into_iter().cloned());
+                }
+            }
+            if members.is_empty() && !b.fallback_tag.is_empty() {
+                // `Balancer.PickOutbound` (app/router/balancing.go): при пустом множестве кандидатов
+                // стратегия возвращает "", и xray уходит на `fallbackTag` — сам xray-core тег не
+                // добавляет в список кандидатов (мы это не эмулируем, только предупреждаем).
+                warnings.push(format!(
+                    "балансировщик {}: ни один селектор не совпал ни с одним outbound, xray использует fallbackTag {}",
+                    b.tag, b.fallback_tag
+                ));
+            }
+            balancer_members.insert(b.tag.clone(), members.into_iter().collect());
+        }
 
         let mut rules = Vec::new();
         for (i, raw) in routing.rules.iter().enumerate() {
@@ -1147,7 +1188,7 @@ impl Engine {
             outbounds_first,
             inbound_tags_list,
             domain_strategy,
-            balancer_selectors,
+            balancer_members,
             rules,
             load_warnings: warnings,
             runtime_warnings: Mutex::new(Vec::new()),
@@ -1231,7 +1272,7 @@ impl Engine {
                 result.outbound = Some(tag.clone());
             }
             RuleTarget::Balancer(tag) => {
-                let selector = self.balancer_selectors.get(tag).cloned().unwrap_or_default();
+                let selector = self.balancer_members.get(tag).cloned().unwrap_or_default();
                 result.balancer = Some(BalancerInfo {
                     tag: tag.clone(),
                     selector,
@@ -1991,8 +2032,38 @@ mod tests {
         assert!(r2.resolved_ips.is_empty());
     }
 
+    /// `app/proxyman/outbound/outbound.go::Manager.Select`: селекторы балансировщика — ПРЕФИКСЫ
+    /// тегов outbound'ов (`strings.HasPrefix`), а не сами теги; `BalancerInfo.selector` должен
+    /// содержать реально подпавшие теги, а не эхо селекторов из конфига.
     #[tokio::test(flavor = "multi_thread")]
-    async fn balancer_target_reports_selector() {
+    async fn balancer_target_reports_expanded_outbound_members() {
+        let asset_dir = std::env::temp_dir();
+        let cfg = r#"{
+            "outbounds": [{"tag": "proxy"}, {"tag": "direct"}, {"tag": "block"}, {"tag": "proxy2"}],
+            "routing": {
+                "balancers": [{"tag": "bal1", "selector": ["proxy", "direct"]}],
+                "rules": [{"domain": ["example.com"], "balancerTag": "bal1"}]
+            }
+        }"#;
+        let e = engine(&[("00.json", cfg)], &asset_dir);
+        let r = e
+            .evaluate(&ctx(Target::Domain("example.com".into())), &no_resolver())
+            .await;
+        assert_eq!(r.outcome, Outcome::Matched);
+        let balancer = r.balancer.unwrap();
+        assert_eq!(balancer.tag, "bal1");
+        // "proxy" матчит и "proxy", и "proxy2" (префикс); порядок — как у реального
+        // `sort.Strings` в xray-core (побайтовый алфавитный), не порядок `outbounds` в конфиге.
+        assert_eq!(
+            balancer.selector,
+            vec!["direct".to_string(), "proxy".to_string(), "proxy2".to_string()]
+        );
+    }
+
+    /// Селектор, не совпавший ни с одним outbound'ом, не должен попадать в `selector` (пустой
+    /// список тегов, ничего похожего на реальный outbound), но должен дать предупреждение.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn balancer_selector_matching_nothing_is_omitted_with_warning() {
         let asset_dir = std::env::temp_dir();
         let cfg = r#"{
             "outbounds": [{"tag": "direct"}],
@@ -2005,10 +2076,37 @@ mod tests {
         let r = e
             .evaluate(&ctx(Target::Domain("example.com".into())), &no_resolver())
             .await;
-        assert_eq!(r.outcome, Outcome::Matched);
         let balancer = r.balancer.unwrap();
-        assert_eq!(balancer.tag, "bal1");
-        assert_eq!(balancer.selector, vec!["proxy-".to_string()]);
+        assert!(balancer.selector.is_empty());
+        assert!(
+            e.warnings()
+                .iter()
+                .any(|w| w.contains("bal1") && w.contains("proxy-") && w.contains("не совпал")),
+            "warnings: {:?}",
+            e.warnings()
+        );
+    }
+
+    /// `Balancer.PickOutbound` (app/router/balancing.go) уходит на `fallbackTag`, когда ни один
+    /// селектор ничего не выбрал — предупреждение должно называть именно этот тег.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn balancer_empty_selection_warns_about_fallback_tag() {
+        let asset_dir = std::env::temp_dir();
+        let cfg = r#"{
+            "outbounds": [{"tag": "direct"}],
+            "routing": {
+                "balancers": [{"tag": "bal1", "selector": ["proxy-"], "fallbackTag": "direct"}],
+                "rules": [{"domain": ["example.com"], "balancerTag": "bal1"}]
+            }
+        }"#;
+        let e = engine(&[("00.json", cfg)], &asset_dir);
+        assert!(
+            e.warnings()
+                .iter()
+                .any(|w| w.contains("bal1") && w.contains("fallbackTag") && w.contains("direct")),
+            "warnings: {:?}",
+            e.warnings()
+        );
     }
 
     #[test]

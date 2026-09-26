@@ -21,13 +21,23 @@
 //! не "ИЛИ"). `ip_in_dat` атрибутов не знает — geoip-правила xray их не поддерживают. Тег и код
 //! страны сравниваются без учёта регистра, атрибуты — тоже (в реальных файлах уже lower-case).
 //!
-//! Кэш: bytes/mmdb-Reader кэшируются по `(path, mtime)` в общем `idle_cache::IdleCache` —
+//! Кэш: mmap/mmdb-Reader кэшируются по `(path, mtime)` в общем `idle_cache::IdleCache` —
 //! вытесняются фоновым tokio-таском, если к записи не обращались 5 минут (на роутере файлы по
 //! ~10 МБ, держать их в памяти вечно накладно). Файл читается ДО вставки в кэш, а не под его
 //! блокировкой: `IdleCache` держит мьютекс только на само добавление/чтение из `HashMap`, а не на
 //! время IO — иначе синхронное чтение файла держало бы стандартный `Mutex` захваченным на потоке
 //! tokio-рантайма (в проде `xray.rs`/`mihomo.rs` зовут эти функции из async-хендлера, оборачивая
 //! блокирующий вызов в `tokio::task::block_in_place`, а не эта функция).
+//!
+//! Вместе с mmap в `DatFile` кэшируется индекс тегов верхнего уровня (`build_tag_index`) — один
+//! проход по length-prefix'ам файла при первой загрузке даёт `HashMap<TAG, (offset, len)>`, и
+//! дальше `site_contains`/`ip_in_dat` берут срез записи по индексу вместо линейного скана `.dat` от
+//! байта 0 на каждый вызов (при сотнях целей × ~10 geo-условий на роутере это иначе грозило упереться
+//! в бюджет запроса). Домены внутри найденной записи по-прежнему не декодируются в кучу целиком —
+//! только запись под совпавшим тегом. Отдельно, лениво и только для категорий, где они реально
+//! встретились, кэшируются скомпилированные `regexp:`-домены (`REGEX_CACHE`, тот же `(path, mtime)` +
+//! код категории, тот же TTL) — раньше каждый `Domain{Type=Regex}` компилировался заново на каждый
+//! вызов `site_contains`.
 
 use crate::geo::parse_cidr_and_match;
 use crate::route_test::idle_cache::IdleCache;
@@ -35,19 +45,40 @@ use memmap2::{Mmap, MmapOptions};
 use prost::bytes::Buf;
 use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 const IDLE_EVICT: Duration = Duration::from_secs(5 * 60);
 
 type DatCacheKey = (PathBuf, SystemTime);
+/// Путь + mtime + код категории (`GOOGLE`, не `GOOGLE@cn` — атрибуты не влияют на компиляцию regex).
+type RegexCacheKey = (PathBuf, SystemTime, String);
+/// Скомпилированные `regexp:`-паттерны одной категории: паттерн → `None`, если невалиден.
+type RegexBucket = Mutex<HashMap<String, Option<regex_lite::Regex>>>;
 
-static DAT_CACHE: LazyLock<IdleCache<DatCacheKey, Mmap>> = LazyLock::new(|| IdleCache::new(IDLE_EVICT));
+/// mmap `.dat`-файла + индекс тегов верхнего уровня (`GeoSite.code`/`GeoIP.code`, регистр как в
+/// файле нормализован в ASCII-uppercase) → `(offset, len)` записи в этом же mmap. Строится один раз
+/// на файл (см. `build_tag_index`), а не при каждом обращении: раньше `find_entry` линейно сканировал
+/// `.dat` от байта 0 на КАЖДЫЙ вызов `site_contains`/`ip_in_dat` — на роутере (10–50× медленнее x86)
+/// с сотнями целей × ~10 geo-условий каждая это грозило упереться в бюджет запроса.
+struct DatFile {
+    mmap: Mmap,
+    tags: HashMap<String, (usize, usize)>,
+}
+
+static DAT_CACHE: LazyLock<IdleCache<DatCacheKey, DatFile>> = LazyLock::new(|| IdleCache::new(IDLE_EVICT));
 static MMDB_CACHE: LazyLock<IdleCache<DatCacheKey, maxminddb::Reader<Mmap>>> =
     LazyLock::new(|| IdleCache::new(IDLE_EVICT));
+/// Скомпилированные `regexp:`-домены (Type=Regex) отдельной категории, по значению паттерна.
+/// Заполняется ЛЕНИВО, по одному паттерну за раз, по мере того как `site_contains` до них
+/// доходит — категории без regex-доменов в этот кэш вообще никогда не попадают (не тратим память
+/// и не компилируем то, что не спросили). `None` — паттерн невалиден, тот же паттерн больше не
+/// перекомпилируется, поведение как раньше (`domain_type_matches`: невалидный regex — тихо не матчит).
+static REGEX_CACHE: LazyLock<IdleCache<RegexCacheKey, RegexBucket>> = LazyLock::new(|| IdleCache::new(IDLE_EVICT));
 
 fn file_mtime(path: &Path) -> Result<SystemTime, String> {
     fs::metadata(path)
@@ -55,11 +86,34 @@ fn file_mtime(path: &Path) -> Result<SystemTime, String> {
         .map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))
 }
 
-fn load_dat_bytes(path: &Path) -> Result<Arc<Mmap>, String> {
-    let mtime = file_mtime(path)?;
+/// Единственный полный проход по `.dat`: собирает `code` (field 1) верхнего уровня каждой записи и
+/// её `(offset, len)` в исходном срезе — сами домены/CIDR внутри записи не декодируются (как и
+/// раньше в `find_entry`). При дублирующемся коде (в реальных базах не встречается) побеждает первое
+/// вхождение — как и линейный `find_entry`, который останавливался на первом совпадении.
+fn build_tag_index(data: &[u8]) -> HashMap<String, (usize, usize)> {
+    let mut map = HashMap::new();
+    let mut buf = data;
+    while buf.has_remaining() {
+        let Ok((tag, wt)) = decode_key(&mut buf) else { break };
+        if tag != 1 || wt != WireType::LengthDelimited {
+            let _ = skip_field(wt, tag, &mut buf, DecodeContext::default());
+            continue;
+        }
+        let Some(entry) = read_len_delim(&mut buf) else { break };
+        let start = data.len() - buf.remaining() - entry.len();
+        let mut code_buf = entry;
+        let code = entry_code(&mut code_buf);
+        if !code.is_empty() {
+            map.entry(code.to_ascii_uppercase()).or_insert((start, entry.len()));
+        }
+    }
+    map
+}
+
+fn load_dat_file(path: &Path, mtime: SystemTime) -> Result<Arc<DatFile>, String> {
     let key = (path.to_path_buf(), mtime);
-    if let Some(mmap) = DAT_CACHE.get(&key) {
-        return Ok(mmap);
+    if let Some(file) = DAT_CACHE.get(&key) {
+        return Ok(file);
     }
     // Смена mtime сама даёт промах кэша (новый ключ) — старая запись под прежним ключом просто
     // больше не запрашивается и со временем уйдёт по TTL простоя, отдельная инвалидация не нужна.
@@ -72,9 +126,36 @@ fn load_dat_bytes(path: &Path) -> Result<Arc<Mmap>, String> {
     // видеть старое (валидное) содержимое инода, а не половину новых байт.
     let mmap = unsafe { MmapOptions::new().map(&file) }
         .map_err(|e| format!("не удалось отобразить {}: {e}", path.display()))?;
-    let mmap = Arc::new(mmap);
-    DAT_CACHE.insert(key, mmap.clone());
-    Ok(mmap)
+    let tags = build_tag_index(&mmap);
+    let dat = Arc::new(DatFile { mmap, tags });
+    DAT_CACHE.insert(key, dat.clone());
+    Ok(dat)
+}
+
+/// Срез записи по тегу (uppercase, ASCII, как в `find_entry` раньше) через индекс — без сканирования.
+fn lookup_entry<'a>(file: &'a DatFile, code: &str) -> Option<&'a [u8]> {
+    let &(off, len) = file.tags.get(&code.to_ascii_uppercase())?;
+    Some(&file.mmap[off..off + len])
+}
+
+/// Компилирует (или берёт из кэша) `regexp:`-паттерн `pattern` категории `code` файла `path`
+/// (mtime уже известен вызывающей стороне — та же величина, что даёт `DatCacheKey`). Кэш общий на
+/// категорию, а не на отдельный вызов `site_contains`: один и тот же паттерн категории `CATEGORY-ADS`
+/// компилируется один раз, даже если её спрашивают под разными `@attr`-вариантами тега.
+fn compiled_regex(path: &Path, mtime: SystemTime, code: &str, pattern: &str) -> Option<regex_lite::Regex> {
+    let key: RegexCacheKey = (path.to_path_buf(), mtime, code.to_ascii_uppercase());
+    let bucket = match REGEX_CACHE.get(&key) {
+        Some(b) => b,
+        None => {
+            let b = Arc::new(Mutex::new(HashMap::new()));
+            REGEX_CACHE.insert(key, b.clone());
+            b
+        }
+    };
+    let mut map = bucket.lock().unwrap();
+    map.entry(pattern.to_string())
+        .or_insert_with(|| regex_lite::Regex::new(pattern).ok())
+        .clone()
 }
 
 fn load_mmdb_reader(path: &Path) -> Result<Arc<maxminddb::Reader<Mmap>>, String> {
@@ -122,27 +203,6 @@ fn entry_code<'a>(entry: &mut &'a [u8]) -> &'a str {
     ""
 }
 
-/// Ищет в `GeoSiteList`/`GeoIPList` запись с кодом `code` (без учёта регистра) и прогоняет её через
-/// `f`. Возвращает `None`, если такого тега в файле нет вообще (не "нет совпадения").
-fn find_entry<T>(data: &[u8], code: &str, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
-    let mut buf = data;
-    while buf.has_remaining() {
-        let Ok((tag, wt)) = decode_key(&mut buf) else { break };
-        if tag != 1 || wt != WireType::LengthDelimited {
-            let _ = skip_field(wt, tag, &mut buf, DecodeContext::default());
-            continue;
-        }
-        let Some(mut entry) = read_len_delim(&mut buf) else {
-            break;
-        };
-        let entry_for_result = entry;
-        if entry_code(&mut entry).eq_ignore_ascii_case(code) {
-            return Some(f(entry_for_result));
-        }
-    }
-    None
-}
-
 struct GeoDomain<'a> {
     kind: i32,
     value: &'a str,
@@ -188,10 +248,11 @@ fn decode_domain(mut buf: &[u8]) -> GeoDomain<'_> {
     d
 }
 
+/// Не занимается `Type=Regex` (kind==1) — `site_contains` матчит их отдельно через `compiled_regex`
+/// (нужны `path`/`mtime`/`code` для ключа кэша, которых у этой чистой функции нет).
 fn domain_type_matches(kind: i32, value: &str, dom_low: &str) -> bool {
     match kind {
         0 => dom_low.contains(value),
-        1 => regex_lite::Regex::new(value).is_ok_and(|re| re.is_match(dom_low)),
         2 => {
             dom_low == value
                 || (dom_low.len() > value.len()
@@ -217,31 +278,37 @@ pub fn site_contains(path: &Path, tag: &str, domain: &str) -> Result<bool, Strin
     if code.is_empty() {
         return Err("пустой тег geosite".into());
     }
-    let bytes = load_dat_bytes(path)?;
+    let mtime = file_mtime(path)?;
+    let file = load_dat_file(path, mtime)?;
     let dom_low = domain.to_lowercase();
-    find_entry(&bytes, code, |entry| {
-        let mut buf = entry;
-        while buf.has_remaining() {
-            let Ok((tag, wt)) = decode_key(&mut buf) else { break };
-            if tag != 2 || wt != WireType::LengthDelimited {
-                let _ = skip_field(wt, tag, &mut buf, DecodeContext::default());
-                continue;
-            }
-            let Some(dom_buf) = read_len_delim(&mut buf) else { break };
-            let d = decode_domain(dom_buf);
-            if !attrs
-                .iter()
-                .all(|a| d.attrs.iter().any(|da| da.eq_ignore_ascii_case(a)))
-            {
-                continue;
-            }
-            if domain_type_matches(d.kind, d.value, &dom_low) {
-                return true;
-            }
+    let Some(entry) = lookup_entry(&file, code) else {
+        return Err(format!("тег {code} не найден в {}", path.display()));
+    };
+    let mut buf = entry;
+    while buf.has_remaining() {
+        let Ok((tag, wt)) = decode_key(&mut buf) else { break };
+        if tag != 2 || wt != WireType::LengthDelimited {
+            let _ = skip_field(wt, tag, &mut buf, DecodeContext::default());
+            continue;
         }
-        false
-    })
-    .ok_or_else(|| format!("тег {code} не найден в {}", path.display()))
+        let Some(dom_buf) = read_len_delim(&mut buf) else { break };
+        let d = decode_domain(dom_buf);
+        if !attrs
+            .iter()
+            .all(|a| d.attrs.iter().any(|da| da.eq_ignore_ascii_case(a)))
+        {
+            continue;
+        }
+        let matched = if d.kind == 1 {
+            compiled_regex(path, mtime, code, d.value).is_some_and(|re| re.is_match(&dom_low))
+        } else {
+            domain_type_matches(d.kind, d.value, &dom_low)
+        };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `true`, если IP подпадает под тег `tag` в geoip-файле `path` (учитывает `reverse_match` записи).
@@ -249,37 +316,38 @@ pub fn ip_in_dat(path: &Path, tag: &str, ip: IpAddr) -> Result<bool, String> {
     if tag.is_empty() {
         return Err("пустой тег geoip".into());
     }
-    let bytes = load_dat_bytes(path)?;
+    let mtime = file_mtime(path)?;
+    let file = load_dat_file(path, mtime)?;
     let (v4, v6) = match ip {
         IpAddr::V4(v4) => (Some(u32::from(v4)), None),
         IpAddr::V6(v6) => (None, Some(u128::from(v6))),
     };
-    find_entry(&bytes, tag, |entry| {
-        let mut buf = entry;
-        let mut reverse = false;
-        let mut any_cidr = false;
-        while buf.has_remaining() {
-            let Ok((t, wt)) = decode_key(&mut buf) else { break };
-            match (t, wt) {
-                (2, WireType::LengthDelimited) => {
-                    if let Some(cidr) = read_len_delim(&mut buf)
-                        && !any_cidr
-                        && parse_cidr_and_match(cidr, v4, v6)
-                    {
-                        any_cidr = true;
-                    }
-                }
-                (3, WireType::Varint) => {
-                    reverse = decode_varint(&mut buf).map(|v| v != 0).unwrap_or(false);
-                }
-                _ => {
-                    let _ = skip_field(wt, t, &mut buf, DecodeContext::default());
+    let Some(entry) = lookup_entry(&file, tag) else {
+        return Err(format!("тег {tag} не найден в {}", path.display()));
+    };
+    let mut buf = entry;
+    let mut reverse = false;
+    let mut any_cidr = false;
+    while buf.has_remaining() {
+        let Ok((t, wt)) = decode_key(&mut buf) else { break };
+        match (t, wt) {
+            (2, WireType::LengthDelimited) => {
+                if let Some(cidr) = read_len_delim(&mut buf)
+                    && !any_cidr
+                    && parse_cidr_and_match(cidr, v4, v6)
+                {
+                    any_cidr = true;
                 }
             }
+            (3, WireType::Varint) => {
+                reverse = decode_varint(&mut buf).map(|v| v != 0).unwrap_or(false);
+            }
+            _ => {
+                let _ = skip_field(wt, t, &mut buf, DecodeContext::default());
+            }
         }
-        if reverse { !any_cidr } else { any_cidr }
-    })
-    .ok_or_else(|| format!("тег {tag} не найден в {}", path.display()))
+    }
+    Ok(if reverse { !any_cidr } else { any_cidr })
 }
 
 #[derive(Deserialize, Default)]
