@@ -11,7 +11,14 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { copyText } from '@/lib/utils'
 import { IconCheck, IconCopy, IconLink, IconPlus, IconRefresh, IconReplace, IconX } from '@tabler/icons-react'
 import { useMemo, useState } from 'react'
-import { listMihomoProxies, proxyItemName, withProxyName } from '../../lib/mihomoReplace'
+import {
+  listMihomoProviders,
+  listMihomoProxies,
+  providerEntryName,
+  proxyItemName,
+  withProviderName,
+  withProxyName,
+} from '../../lib/mihomoReplace'
 import { useAppContext, useModalContext } from '../../lib/store'
 import { InputGroup, InputGroupAddon, InputGroupInput } from '../ui/input-group'
 import { SelectGroup } from '@/components/ui/select'
@@ -172,7 +179,7 @@ function generateSubYaml(form: SubscriptionForm): string {
     if (form.excludeType) sub['exclude-type'] = form.excludeType
   }
 
-  return toYaml({ [form.name]: sub }, 2).trimEnd() + '\n'
+  return toYaml({ [form.name.trim()]: sub }, 2).trimEnd() + '\n'
 }
 
 function createDefaultForm(url: string, existingConfig: string): SubscriptionForm {
@@ -196,13 +203,85 @@ function createDefaultForm(url: string, existingConfig: string): SubscriptionFor
   }
 }
 
+interface ReplacePanelProps {
+  label: string
+  items: string[]
+  value: string | null
+  onValueChange: (v: string | null) => void
+  placeholder: string
+  emptyHint: string
+  renameRefs: boolean
+  onRenameRefsChange: (v: boolean) => void
+  description: string | null
+  extraHint: string | null
+  confirmDisabled: boolean
+  onConfirm: () => void
+}
+
+function ReplacePanel({
+  label,
+  items,
+  value,
+  onValueChange,
+  placeholder,
+  emptyHint,
+  renameRefs,
+  onRenameRefsChange,
+  description,
+  extraHint,
+  confirmDisabled,
+  onConfirm,
+}: ReplacePanelProps) {
+  return (
+    <div className="border-border bg-muted/10 flex w-full shrink-0 flex-col gap-3 border-t p-3">
+      <div className="grid gap-1.5">
+        <Label className="text-xs">{label}</Label>
+        <Combobox
+          items={items}
+          value={value}
+          itemToStringLabel={(item) => item}
+          itemToStringValue={(item) => item}
+          onValueChange={onValueChange}
+          autoHighlight
+        >
+          <ComboboxInput fullWidth placeholder={placeholder} disabled={items.length === 0} />
+          <ComboboxContent>
+            <ComboboxEmpty>Ничего не найдено</ComboboxEmpty>
+            <ComboboxList>
+              {(item: string) => (
+                <ComboboxItem key={item} value={item}>
+                  {item}
+                </ComboboxItem>
+              )}
+            </ComboboxList>
+          </ComboboxContent>
+        </Combobox>
+        {items.length === 0 && <p className="text-muted-foreground text-xs">{emptyHint}</p>}
+      </div>
+
+      <div className="flex items-center justify-between gap-3">
+        <div className="grid gap-0.5">
+          <Label className="text-xs">Переименовать ссылки во всём конфиге</Label>
+          {description && <p className="text-muted-foreground text-xs">{description}</p>}
+          {extraHint && <p className="text-destructive text-xs">{extraHint}</p>}
+        </div>
+        <Switch size="sm" checked={renameRefs} onCheckedChange={onRenameRefsChange} />
+      </div>
+
+      <Button size="sm" className="w-full" disabled={confirmDisabled} onClick={onConfirm}>
+        Заменить
+      </Button>
+    </div>
+  )
+}
+
 interface Props {
   onGenerate: (uri: string, excludeName?: string) => { content: string; type: string } | null
   onAddToConfig: (content: string, type: string, position: 'start' | 'end') => void
-  onReplaceProxy: (content: string, oldName: string, renameRefs: boolean) => void
+  onReplace: (kind: 'proxy' | 'provider', content: string, oldName: string, renameRefs: boolean) => void
 }
 
-export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props) {
+export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
   const { showToast, state } = useAppContext({ includeConfigs: true })
   const { modals, dispatch } = useModalContext()
   const [uri, setUri] = useState('')
@@ -217,6 +296,8 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
   const [replaceOpen, setReplaceOpen] = useState(false)
   const [replaceTarget, setReplaceTarget] = useState<string | null>(null)
   const [renameRefs, setRenameRefs] = useState(true)
+  const [subDefaultName, setSubDefaultName] = useState<string | null>(null)
+  const [providerNameAutoSet, setProviderNameAutoSet] = useState(false)
 
   const isValidUri = SUPPORTED_PROTOCOLS.some((p) => {
     if (state.currentCore !== 'mihomo' && (p === 'http://' || p === 'https://')) return false
@@ -230,12 +311,14 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
       setResult(null)
       setResultUri(null)
       setSubForm(null)
+      setSubDefaultName(null)
       setIsCustomUA(false)
       setCustomUA('')
       setGenerated(false)
       setReplaceOpen(false)
       setReplaceTarget(null)
       setRenameRefs(true)
+      setProviderNameAutoSet(false)
     }, 300)
   }
 
@@ -245,11 +328,13 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
     setReplaceOpen(false)
     setReplaceTarget(null)
     setRenameRefs(true)
+    setProviderNameAutoSet(false)
 
     if (/^https?:\/\//i.test(trimmed)) {
       const existingContent = state.configs.find((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')?.content ?? ''
       const form = createDefaultForm(trimmed, existingContent)
       setSubForm(form)
+      setSubDefaultName(form.name)
       setResult({ content: '', type: 'proxy-provider', protocol: 'HTTP' })
       setResultUri(null)
       setSubTab('form')
@@ -264,10 +349,12 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
         setResult({ ...generated, protocol })
         setResultUri(trimmed)
         setSubForm(null)
+        setSubDefaultName(null)
       } else {
         setResult(null)
         setResultUri(null)
         setSubForm(null)
+        setSubDefaultName(null)
       }
     } catch (e: any) {
       showToast(e.message, 'error')
@@ -287,21 +374,41 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
   function toggleReplace() {
     const next = !replaceOpen
     setReplaceOpen(next)
-    if (!next && replaceTarget) {
+    if (next) return
+    if (replaceTarget) {
       setReplaceTarget(null)
-      regenerateResult()
+      if (isMihomoProxyFlow) regenerateResult()
+    }
+    if (isMihomoProviderFlow && providerNameAutoSet && subDefaultName) {
+      updateSubField('name', subDefaultName)
+      setProviderNameAutoSet(false)
     }
   }
 
   function selectReplaceTarget(target: string | null) {
     setReplaceTarget(target)
-    regenerateResult(target ?? undefined)
+    if (isMihomoProxyFlow) {
+      regenerateResult(target ?? undefined)
+      return
+    }
+    if (isMihomoProviderFlow && subForm && target && (providerNameAutoSet || subForm.name === subDefaultName)) {
+      updateSubField('name', target)
+      setProviderNameAutoSet(true)
+    }
   }
 
   function confirmReplace() {
-    if (!result || !replaceTarget || (renameRefs && !newProxyName)) return
-    onReplaceProxy(previewContent, replaceTarget, renameRefs)
-    close()
+    if (isMihomoProxyFlow) {
+      if (!result || !replaceTarget || (renameRefs && !newProxyName)) return
+      onReplace('proxy', previewContent, replaceTarget, renameRefs)
+      close()
+      return
+    }
+    if (isMihomoProviderFlow) {
+      if (!subForm || !replaceTarget || providerReplaceDisabled) return
+      onReplace('provider', finalProviderContent, replaceTarget, renameRefs)
+      close()
+    }
   }
 
   function updateSubField<K extends keyof SubscriptionForm>(key: K, value: SubscriptionForm[K]) {
@@ -321,8 +428,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
 
   async function copySub() {
     if (!subForm) return
-    const content = generateSubYaml(subForm)
-    const ok = await copyText(content)
+    const ok = await copyText(finalProviderContent)
     if (!ok) {
       showToast('Ошибка копирования', 'error')
       return
@@ -350,14 +456,34 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
 
   const showSubForm = generated && subForm && result
   const isMihomoProxyFlow = state.currentCore === 'mihomo' && result?.type === 'proxy'
+  const isMihomoProviderFlow = state.currentCore === 'mihomo' && Boolean(showSubForm)
   const configYamlContent = state.configs.find((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')?.content ?? ''
   const mihomoProxies = useMemo(
     () => (isMihomoProxyFlow ? listMihomoProxies(configYamlContent) : []),
     [isMihomoProxyFlow, configYamlContent]
   )
+  const providerNames = useMemo(
+    () => (isMihomoProviderFlow ? listMihomoProviders(configYamlContent) : []),
+    [isMihomoProviderFlow, configYamlContent]
+  )
   const newProxyName = result ? proxyItemName(result.content) : null
   const previewContent =
     result && replaceTarget ? (renameRefs ? result.content : withProxyName(result.content, replaceTarget)) : (result?.content ?? '')
+
+  const providerEntry = isMihomoProviderFlow && subForm ? generateSubYaml(subForm) : ''
+  const newProviderName = providerEntry ? providerEntryName(providerEntry) : null
+  const finalProviderContent =
+    providerEntry && replaceTarget ? (renameRefs ? providerEntry : withProviderName(providerEntry, replaceTarget)) : providerEntry
+  const trimmedSubName = subForm?.name.trim() ?? ''
+  const providerNameConflict = Boolean(
+    isMihomoProviderFlow &&
+      renameRefs &&
+      replaceTarget !== null &&
+      subForm !== null &&
+      trimmedSubName !== replaceTarget &&
+      providerNames.includes(trimmedSubName)
+  )
+  const providerReplaceDisabled = !replaceTarget || newProviderName === null || providerNameConflict || !trimmedSubName
 
   return (
     <TooltipProvider delayDuration={500}>
@@ -403,7 +529,10 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
                               <Label className="text-xs">Название провайдера</Label>
                               <Input
                                 value={subForm.name}
-                                onChange={(e) => updateSubField('name', e.target.value)}
+                                onChange={(e) => {
+                                  updateSubField('name', e.target.value)
+                                  setProviderNameAutoSet(false)
+                                }}
                                 className="h-8 text-xs"
                               />
                             </div>
@@ -614,20 +743,75 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
                     <pre
                       className="m-0 p-3 font-mono text-[13px] tracking-tight"
                       dangerouslySetInnerHTML={{
-                        __html: highlightCode(subForm ? generateSubYaml(subForm) : ''),
+                        __html: highlightCode(subForm ? finalProviderContent : ''),
                       }}
                     />
                   </TabsContent>
                 </Tabs>
 
                 <div className="border-border bg-muted/10 flex w-full shrink-0 gap-2 border-t p-2">
-                  <Button variant="outline" size="sm" className="flex-1 gap-1.5 text-xs" onClick={() => addSubToConfig('start')}>
-                    <IconPlus /> В начало
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={replaceOpen}
+                    className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
+                    onClick={() => addSubToConfig('start')}
+                  >
+                    <IconPlus /> <span className="truncate">В начало</span>
                   </Button>
-                  <Button variant="outline" size="sm" className="flex-1 gap-1.5 text-xs" onClick={() => addSubToConfig('end')}>
-                    <IconPlus /> В конец
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={replaceOpen}
+                    className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
+                    onClick={() => addSubToConfig('end')}
+                  >
+                    <IconPlus /> <span className="truncate">В конец</span>
                   </Button>
+                  {isMihomoProviderFlow && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
+                      onClick={toggleReplace}
+                    >
+                      <IconReplace /> <span className="truncate">Заменить…</span>
+                    </Button>
+                  )}
                 </div>
+
+                {isMihomoProviderFlow && replaceOpen && (
+                  <ReplacePanel
+                    label="Провайдер для замены"
+                    items={providerNames}
+                    value={replaceTarget}
+                    onValueChange={selectReplaceTarget}
+                    placeholder="Выберите провайдера"
+                    emptyHint="В config.yaml нет провайдеров"
+                    renameRefs={renameRefs}
+                    onRenameRefsChange={setRenameRefs}
+                    description={
+                      replaceTarget
+                        ? renameRefs
+                          ? newProviderName
+                            ? `Ссылки на «${replaceTarget}» в proxy-groups (use) станут «${newProviderName}»`
+                            : null
+                          : `Новый провайдер получит имя «${replaceTarget}», ссылки не изменятся`
+                        : null
+                    }
+                    extraHint={
+                      replaceTarget
+                        ? newProviderName === null
+                          ? 'Не удалось определить имя провайдера'
+                          : providerNameConflict
+                            ? `Имя «${trimmedSubName}» уже используется`
+                            : null
+                        : null
+                    }
+                    confirmDisabled={providerReplaceDisabled}
+                    onConfirm={confirmReplace}
+                  />
+                )}
               </div>
             )}
 
@@ -660,6 +844,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
                   <Button
                     variant="outline"
                     size="sm"
+                    disabled={replaceOpen}
                     className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
                     onClick={() => addToConfig('start')}
                   >
@@ -668,6 +853,7 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
                   <Button
                     variant="outline"
                     size="sm"
+                    disabled={replaceOpen}
                     className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
                     onClick={() => addToConfig('end')}
                   >
@@ -686,57 +872,28 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
                 </div>
 
                 {isMihomoProxyFlow && replaceOpen && (
-                  <div className="border-border bg-muted/10 flex w-full shrink-0 flex-col gap-3 border-t p-3">
-                    <div className="grid gap-1.5">
-                      <Label className="text-xs">Прокси для замены</Label>
-                      <Combobox
-                        items={mihomoProxies}
-                        value={replaceTarget}
-                        itemToStringLabel={(item) => item}
-                        itemToStringValue={(item) => item}
-                        onValueChange={selectReplaceTarget}
-                        autoHighlight
-                      >
-                        <ComboboxInput fullWidth placeholder="Выберите прокси" disabled={mihomoProxies.length === 0} />
-                        <ComboboxContent>
-                          <ComboboxEmpty>Ничего не найдено</ComboboxEmpty>
-                          <ComboboxList>
-                            {(item: string) => (
-                              <ComboboxItem key={item} value={item}>
-                                {item}
-                              </ComboboxItem>
-                            )}
-                          </ComboboxList>
-                        </ComboboxContent>
-                      </Combobox>
-                      {mihomoProxies.length === 0 && <p className="text-muted-foreground text-xs">В config.yaml нет прокси</p>}
-                    </div>
-
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="grid gap-0.5">
-                        <Label className="text-xs">Переименовать ссылки во всём конфиге</Label>
-                        {replaceTarget && (
-                          <p className="text-muted-foreground text-xs">
-                            {renameRefs
-                              ? newProxyName
-                                ? `Ссылки на «${replaceTarget}» в группах, правилах, dialer-proxy и DNS станут «${newProxyName}»`
-                                : 'Не удалось определить имя нового прокси'
-                              : `Новый прокси получит имя «${replaceTarget}», ссылки не изменятся`}
-                          </p>
-                        )}
-                      </div>
-                      <Switch size="sm" checked={renameRefs} onCheckedChange={(v) => setRenameRefs(v)} />
-                    </div>
-
-                    <Button
-                      size="sm"
-                      className="w-full"
-                      disabled={!replaceTarget || (renameRefs && !newProxyName)}
-                      onClick={confirmReplace}
-                    >
-                      Заменить
-                    </Button>
-                  </div>
+                  <ReplacePanel
+                    label="Прокси для замены"
+                    items={mihomoProxies}
+                    value={replaceTarget}
+                    onValueChange={selectReplaceTarget}
+                    placeholder="Выберите прокси"
+                    emptyHint="В config.yaml нет прокси"
+                    renameRefs={renameRefs}
+                    onRenameRefsChange={setRenameRefs}
+                    description={
+                      replaceTarget
+                        ? renameRefs
+                          ? newProxyName
+                            ? `Ссылки на «${replaceTarget}» в группах, правилах, dialer-proxy и DNS станут «${newProxyName}»`
+                            : 'Не удалось определить имя нового прокси'
+                          : `Новый прокси получит имя «${replaceTarget}», ссылки не изменятся`
+                        : null
+                    }
+                    extraHint={null}
+                    confirmDisabled={!replaceTarget || (renameRefs && !newProxyName)}
+                    onConfirm={confirmReplace}
+                  />
                 )}
               </div>
             )}
@@ -760,9 +917,11 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props
                         setResult(null)
                         setResultUri(null)
                         setSubForm(null)
+                        setSubDefaultName(null)
                         setReplaceOpen(false)
                         setReplaceTarget(null)
                         setRenameRefs(true)
+                        setProviderNameAutoSet(false)
                       }}
                       className="text-muted-foreground hover:text-destructive hover:bg-transparent!"
                     >

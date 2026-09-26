@@ -1,6 +1,16 @@
 import { describe, expect, test } from 'bun:test'
 import { parseDocument } from 'yaml'
-import { listMihomoProxies, listMihomoTakenNames, proxyItemName, replaceMihomoProxy, withProxyName } from '../src/lib/mihomoReplace'
+import {
+  listMihomoProviders,
+  listMihomoProxies,
+  listMihomoTakenNames,
+  providerEntryName,
+  proxyItemName,
+  replaceMihomoProvider,
+  replaceMihomoProxy,
+  withProviderName,
+  withProxyName,
+} from '../src/lib/mihomoReplace'
 
 const ITEM_A = "  - name: 'A'\n    type: vless\n    server: a.example.com\n    port: 443\n"
 const ITEM_EMOJI = "  - name: 'DE 🇩🇪 node'\n    type: vless\n    server: de.example.com\n    port: 443\n"
@@ -533,5 +543,430 @@ describe('replaceMihomoProxy: nested item bodies and document ordering', () => {
     expectParses(res.text)
     const lines = res.text.split('\n')
     expect(lines[res.line - 1].trim().startsWith('- name:')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// proxy-providers
+// ---------------------------------------------------------------------------
+
+const ENTRY_A =
+  '  subscription_1:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n'
+
+const ENTRY_NESTED =
+  '  subscription_1:\n' +
+  '    type: http\n' +
+  '    url: https://example.com/sub\n' +
+  '    interval: 43200\n' +
+  '    override:\n' +
+  '      udp: true\n' +
+  '    health-check:\n' +
+  '      enable: true\n' +
+  '      url: https://www.gstatic.com/generate_204\n' +
+  '      interval: 300\n' +
+  '      expected-status: 204\n' +
+  '    header:\n' +
+  '      User-Agent: ["ClashMeta/1.19.30; mihomo/1.19.30"]\n' +
+  '      x-hwid: ["A1B2C3D4E5F6"]\n'
+
+describe('listMihomoProviders', () => {
+  test('lists provider keys in order', () => {
+    const text = 'proxy-providers:\n  p1:\n    type: http\n  p2:\n    type: http\n'
+    expect(listMihomoProviders(text)).toEqual(['p1', 'p2'])
+  })
+
+  test('returns [] for empty flow map {}', () => {
+    expect(listMihomoProviders('proxy-providers: {}\n')).toEqual([])
+  })
+
+  test('returns [] for null', () => {
+    expect(listMihomoProviders('proxy-providers:\n')).toEqual([])
+  })
+
+  test('returns [] when section missing', () => {
+    expect(listMihomoProviders('mode: rule\n')).toEqual([])
+  })
+
+  test('returns [] on parse error', () => {
+    expect(listMihomoProviders('not: [valid: yaml')).toEqual([])
+  })
+
+  test('unique keys in first-occurrence order', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n  b:\n    type: http\n'
+    expect(listMihomoProviders(text)).toEqual(['a', 'b'])
+  })
+})
+
+describe('providerEntryName', () => {
+  test('extracts key from generated entry', () => {
+    expect(providerEntryName(ENTRY_A)).toBe('subscription_1')
+  })
+
+  test('extracts key from nested generated entry', () => {
+    expect(providerEntryName(ENTRY_NESTED)).toBe('subscription_1')
+  })
+
+  test('returns null on unparsable input (nested mapping in compact form)', () => {
+    expect(providerEntryName('  a: b:\n    type: http\n')).toBeNull()
+  })
+
+  test('returns null when entry has more than one top-level key', () => {
+    expect(providerEntryName('  a:\n    type: http\n  b:\n    type: http\n')).toBeNull()
+  })
+
+  test('accepts scalar value entry', () => {
+    expect(providerEntryName('  a: b\n')).toBe('a')
+  })
+})
+
+describe('withProviderName', () => {
+  test('replaces plain-safe key, keeps rest byte-identical', () => {
+    const result = withProviderName(ENTRY_A, 'sub2')
+    expect(result).toBe(
+      '  sub2:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n'
+    )
+  })
+
+  test('quotes key containing ": "', () => {
+    const result = withProviderName(ENTRY_A, 'a: b')
+    expect(result.startsWith("  'a: b':\n")).toBe(true)
+  })
+
+  test('quotes YAML 1.1 bool-like key "yes"', () => {
+    const result = withProviderName(ENTRY_A, 'yes')
+    expect(result.startsWith("  'yes':\n")).toBe(true)
+  })
+
+  test('quotes key starting with "#"', () => {
+    const result = withProviderName(ENTRY_A, '#x')
+    expect(result.startsWith("  '#x':\n")).toBe(true)
+  })
+
+  test('plain-safe key with apostrophe is left unquoted', () => {
+    const result = withProviderName(ENTRY_A, "it's a")
+    expect(result.startsWith("  it's a:\n")).toBe(true)
+  })
+
+  test('escapes single quotes in a key that needs quoting', () => {
+    const result = withProviderName(ENTRY_A, "it's: a")
+    expect(result.startsWith("  'it''s: a':\n")).toBe(true)
+  })
+})
+
+describe('replaceMihomoProvider: basic replace', () => {
+  test('renameRefs=false keeps old name', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n    url: https://a\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expect(res.name).toBe('old')
+    expect(res.refs).toBe(0)
+    expect(res.line).toBe(2)
+    expect(res.text).toBe(
+      'proxy-providers:\n  old:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n'
+    )
+  })
+
+  test('renameRefs=true uses generated name', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n    url: https://a\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.name).toBe('subscription_1')
+    expect(res.line).toBe(2)
+    expect(res.text).toBe(
+      'proxy-providers:\n  subscription_1:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n'
+    )
+  })
+
+  test('name unchanged (generated name === oldName) yields refs 0', () => {
+    const text = 'proxy-providers:\n  subscription_1:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'subscription_1', ENTRY_A, { renameRefs: true })
+    expect(res.name).toBe('subscription_1')
+    expect(res.refs).toBe(0)
+  })
+
+  test('reference before provider section textually still yields correct line number', () => {
+    const text = 'proxy-groups:\n  - name: auto\n    use:\n      - old\nproxy-providers:\n  old:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.refs).toBe(1)
+    expect(res.name).toBe('subscription_1')
+    expectParses(res.text)
+    const lines = res.text.split('\n')
+    expect(lines[res.line - 1].trim()).toBe('subscription_1:')
+  })
+})
+
+describe('replaceMihomoProvider: entry key column alignment (does not assume column 2)', () => {
+  // key at column 3, body nested 2 deeper (column 5)
+  const ENTRY_KEYCOL3 = '   colent:\n     type: http\n     url: https://a\n'
+  // key at column 4, body nested 2 deeper (column 6)
+  const ENTRY_KEYCOL4 = '    colent:\n      type: http\n      url: https://a\n'
+
+  test('entry key at column 3 into indent-2 config: key realigned to column 2, parses', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_KEYCOL3, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text).toContain('  old:\n    type: http\n    url: https://a\n')
+  })
+
+  test('entry key at column 3 into indent-4 config: key realigned to column 4, parses', () => {
+    const text = 'proxy-providers:\n    old:\n      type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_KEYCOL3, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text).toContain('    old:\n      type: http\n      url: https://a\n')
+  })
+
+  test('entry key at column 4 into indent-2 config: key realigned to column 2, parses', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_KEYCOL4, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text).toContain('  old:\n    type: http\n    url: https://a\n')
+  })
+
+  test('entry key at column 4 into indent-4 config: key realigned to column 4, parses', () => {
+    const text = 'proxy-providers:\n    old:\n      type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_KEYCOL4, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text).toContain('    old:\n      type: http\n      url: https://a\n')
+  })
+})
+
+describe('replaceMihomoProvider: key quoting on renameRefs=true (matches withProviderName)', () => {
+  const baseWithUse = (oldName: string) =>
+    `proxy-providers:\n  ${oldName}:\n    type: http\nproxy-groups:\n  - name: g\n    use:\n      - ${oldName}\n`
+
+  for (const name of ['yes', 'no', 'on', 'off']) {
+    test(`plain YAML 1.1 bool-like name "${name}" is quoted in the inserted key`, () => {
+      const entry = ENTRY_A.replace('subscription_1', name)
+      const text = baseWithUse('old')
+      const res = replaceMihomoProvider(text, 'old', entry, { renameRefs: true })
+      expect(res.name).toBe(name)
+      expect(res.text).toContain(`  '${name}':\n`)
+      expect(res.text).toContain(`      - '${name}'\n`)
+      expectParses(res.text)
+    })
+  }
+
+  test('name needing quoting due to "#" is quoted consistently (built via withProviderName)', () => {
+    const entry = withProviderName(ENTRY_A, 'a #b')
+    const text = baseWithUse('old')
+    const res = replaceMihomoProvider(text, 'old', entry, { renameRefs: true })
+    expect(res.name).toBe('a #b')
+    expect(res.text).toContain(`  'a #b':\n`)
+    expect(res.text).toContain(`      - 'a #b'\n`)
+    expectParses(res.text)
+  })
+})
+
+describe('replaceMihomoProvider: key styles in config', () => {
+  test('plain key', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expect(res.name).toBe('old')
+  })
+
+  test("single-quoted key 'my sub' in config, plain-safe name re-emitted unquoted", () => {
+    const text = "proxy-providers:\n  'my sub':\n    type: http\n"
+    const res = replaceMihomoProvider(text, 'my sub', ENTRY_A, { renameRefs: false })
+    expect(res.name).toBe('my sub')
+    expect(res.text).toContain('  my sub:\n    type: http\n    url:')
+    expectParses(res.text)
+  })
+
+  test('double-quoted key "x"', () => {
+    const text = 'proxy-providers:\n  "x":\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'x', ENTRY_A, { renameRefs: false })
+    expect(res.name).toBe('x')
+  })
+
+  test('key with space and emoji', () => {
+    const text = 'proxy-providers:\n  🇩🇪 DE sub:\n    type: http\n'
+    const res = replaceMihomoProvider(text, '🇩🇪 DE sub', ENTRY_A, { renameRefs: false })
+    expect(res.name).toBe('🇩🇪 DE sub')
+    expectParses(res.text)
+  })
+
+  test('key indent 2', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expect(res.text).toContain('  old:\n    type: http\n    url:')
+  })
+
+  test('key indent 4', () => {
+    const text = 'proxy-providers:\n    old:\n      type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text).toContain('    old:\n      type: http\n      url: https://example.com/sub\n      interval: 43200\n      override:\n        udp: true\n')
+  })
+})
+
+describe('replaceMihomoProvider: use[] references', () => {
+  test('renames block-form proxy-groups[].use[]', () => {
+    const text =
+      'proxy-providers:\n  old:\n    type: http\nproxy-groups:\n  - name: auto\n    use:\n      - old\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.refs).toBe(1)
+    expect(res.text).toContain('use:\n      - subscription_1\n')
+  })
+
+  test('renames flow-form proxy-groups[].use[]', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\nproxy-groups:\n  - name: auto\n    use: [old]\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.refs).toBe(1)
+    expect(res.text).toContain('use: [subscription_1]')
+    expectParses(res.text)
+  })
+
+  test('proxy-groups[].proxies[] entry equal to provider name is untouched', () => {
+    const text =
+      'proxy-providers:\n  old:\n    type: http\nproxy-groups:\n  - name: auto\n    proxies:\n      - old\n    use:\n      - old\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.refs).toBe(1)
+    expect(res.text).toContain('proxies:\n      - old\n')
+    expect(res.text).toContain('use:\n      - subscription_1\n')
+  })
+
+  test('include-all-providers is untouched', () => {
+    const text =
+      'proxy-providers:\n  old:\n    type: http\nproxy-groups:\n  - name: auto\n    include-all-providers: true\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.text).toContain('include-all-providers: true\n')
+  })
+})
+
+describe('replaceMihomoProvider: position & neighbours', () => {
+  test('replaces first provider, keeps others intact', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n  b:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'a', ENTRY_A, { renameRefs: false })
+    expect(res.text).toBe(
+      'proxy-providers:\n  a:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n  b:\n    type: http\n'
+    )
+  })
+
+  test('replaces middle provider', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n  b:\n    type: http\n  c:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'b', ENTRY_A, { renameRefs: false })
+    expect(res.text).toBe(
+      'proxy-providers:\n  a:\n    type: http\n  b:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n  c:\n    type: http\n'
+    )
+  })
+
+  test('replaces last provider at EOF without trailing newline', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n  b:\n    type: http'
+    const res = replaceMihomoProvider(text, 'b', ENTRY_A, { renameRefs: false })
+    expect(res.text).toBe(
+      'proxy-providers:\n  a:\n    type: http\n  b:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n'
+    )
+  })
+
+  test('proxy-providers as last section in document', () => {
+    const text = 'mode: rule\nproxy-providers:\n  old:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text.startsWith('mode: rule\n')).toBe(true)
+  })
+
+  test('proxy-providers followed by proxy-groups', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\nproxy-groups:\n  - name: g\n    proxies: [DIRECT]\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expect(res.text).toContain('proxy-groups:\n  - name: g\n    proxies: [DIRECT]\n')
+    expectParses(res.text)
+  })
+
+  test('neighbour provider with nested health-check/header preserved byte-for-byte', () => {
+    const neighbourBlock = ENTRY_NESTED.replace('subscription_1', 'neighbour')
+    const text = `proxy-providers:\n  old:\n    type: http\n${neighbourBlock}`
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expect(res.text).toContain(neighbourBlock)
+    expectParses(res.text)
+  })
+
+  test('comment between pairs preserved', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n  # keep me\n  b:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'a', ENTRY_A, { renameRefs: false })
+    expect(res.text).toBe(
+      'proxy-providers:\n  a:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n  # keep me\n  b:\n    type: http\n'
+    )
+  })
+})
+
+describe('replaceMihomoProvider: alias values', () => {
+  test('replacing a provider whose value is an alias works', () => {
+    const text = 'proxy-providers:\n  tpl: &tpl\n    type: http\n  old: *tpl\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expect(res.text).toBe(
+      'proxy-providers:\n  tpl: &tpl\n    type: http\n  old:\n    type: http\n    url: https://example.com/sub\n    interval: 43200\n    override:\n      udp: true\n'
+    )
+    expectParses(res.text)
+  })
+
+  test('target declaring an anchor used by another provider throws', () => {
+    const text = 'proxy-providers:\n  old: &tpl\n    type: http\n  other: *tpl\n'
+    expect(() => replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })).toThrow('якорь')
+    expectParses(text)
+  })
+
+  test('anchor unused elsewhere is fine to drop', () => {
+    const text = 'proxy-providers:\n  old: &tpl\n    type: http\n  other:\n    type: http\n'
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })
+    expectParses(res.text)
+    expect(res.text).not.toContain('&tpl')
+  })
+})
+
+describe('replaceMihomoProvider: collisions', () => {
+  test('collision with another provider name throws', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n  subscription_1:\n    type: http\n'
+    expect(() => replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })).toThrow('уже используется')
+  })
+
+  test('name equal to a proxy name is allowed (separate namespace)', () => {
+    const text =
+      "proxies:\n  - name: 'subscription_1'\n    type: vless\nproxy-providers:\n  old:\n    type: http\n"
+    const res = replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: true })
+    expect(res.name).toBe('subscription_1')
+  })
+})
+
+describe('replaceMihomoProvider: negative / error cases', () => {
+  test('not found throws', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n'
+    expect(() => replaceMihomoProvider(text, 'missing', ENTRY_A, { renameRefs: false })).toThrow('не найден')
+  })
+
+  test('missing proxy-providers section throws not-found', () => {
+    const text = 'mode: rule\n'
+    expect(() => replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })).toThrow('не найден')
+  })
+
+  test('YAML parse error throws', () => {
+    const text = 'proxy-providers:\n  old: [unterminated\n'
+    expect(() => replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })).toThrow('Не удалось разобрать')
+  })
+
+  test('duplicate map keys (parse error) throws', () => {
+    const text = 'proxy-providers:\n  a:\n    type: http\n  a:\n    type: http\n'
+    expect(() => replaceMihomoProvider(text, 'a', ENTRY_A, { renameRefs: false })).toThrow('Не удалось разобрать')
+  })
+
+  test('flow-style proxy-providers map throws', () => {
+    const text = 'proxy-providers: {old: {type: http}}\n'
+    expect(() => replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })).toThrow('flow-стиле')
+  })
+
+  test('flow-style target value throws', () => {
+    const text = 'proxy-providers:\n  old: {type: http}\n'
+    expect(() => replaceMihomoProvider(text, 'old', ENTRY_A, { renameRefs: false })).toThrow('flow-стиле')
+  })
+
+  test('invalid entry with renameRefs=true throws, text unchanged', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n'
+    const broken = '  a: b:\n    type: http\n'
+    expect(() => replaceMihomoProvider(text, 'old', broken, { renameRefs: true })).toThrow('корректным YAML')
+    expect(text).toBe('proxy-providers:\n  old:\n    type: http\n')
+  })
+
+  test('invalid entry with renameRefs=false throws, text unchanged', () => {
+    const text = 'proxy-providers:\n  old:\n    type: http\n'
+    const broken = '  a: b:\n    type: http\n'
+    expect(() => replaceMihomoProvider(text, 'old', broken, { renameRefs: false })).toThrow('корректным YAML')
+    expect(text).toBe('proxy-providers:\n  old:\n    type: http\n')
   })
 })

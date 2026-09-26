@@ -1,5 +1,5 @@
 import { isAlias, isMap, isScalar, isSeq, parseDocument, visit } from 'yaml'
-import type { Document, Scalar, YAMLMap } from 'yaml'
+import type { Document, Node, Scalar, YAMLMap } from 'yaml'
 
 /** Результат замены прокси в config.yaml */
 export interface ReplaceProxyResult {
@@ -337,9 +337,10 @@ export function withProxyName(item: string, name: string): string {
   return item.slice(0, start) + quoteSingle(name) + item.slice(end)
 }
 
-/** Имена якорей (&x), объявленных в поддереве узла */
-function collectAnchorNames(node: YAMLMap): Set<string> {
+/** Имена якорей (&x), объявленных в поддереве узла; пустой набор для null/undefined */
+function collectAnchorNamesIn(node: Node | null | undefined): Set<string> {
   const anchors = new Set<string>()
+  if (node === null || node === undefined) return anchors
   visit(node, (_key, n) => {
     if (n && typeof n === 'object' && 'anchor' in n && typeof (n as { anchor?: unknown }).anchor === 'string') {
       const a = (n as { anchor: string }).anchor
@@ -360,6 +361,44 @@ function collectAliasSourcesOutside(doc: Document, range: readonly [number, numb
     }
   })
   return sources
+}
+
+/** Расширяет конец региона до конца строки (если элемент не заканчивается на \n сам),
+ * отфильтровывает кандидатов на переименование ссылок, пересекающихся с заменяемым регионом,
+ * применяет все правки (отсортированные по позиции) и вычисляет номер строки вставленного блока.
+ * Общая часть replaceMihomoProxy и replaceMihomoProvider. */
+function spliceRegion(
+  text: string,
+  lineStart: number,
+  itemEnd: number,
+  insertion: string,
+  candidateRefEdits: Edit[]
+): { text: string; line: number; refs: number } {
+  let regionEnd = itemEnd
+  if (regionEnd < text.length && text[regionEnd - 1] !== '\n') {
+    const nlAfter = text.indexOf('\n', regionEnd)
+    regionEnd = nlAfter === -1 ? text.length : nlAfter + 1
+  }
+
+  const refEdits = candidateRefEdits.filter((edit) => !(edit.start < regionEnd && edit.end > lineStart))
+
+  const edits: Edit[] = [...refEdits, { start: lineStart, end: regionEnd, text: insertion, isItem: true }]
+  edits.sort((a, b) => a.start - b.start)
+
+  let result = ''
+  let cursor = 0
+  let itemFinalStart = -1
+  for (const edit of edits) {
+    result += text.slice(cursor, edit.start)
+    if (edit.isItem) itemFinalStart = result.length
+    result += edit.text
+    cursor = edit.end
+  }
+  result += text.slice(cursor)
+
+  const line = result.slice(0, itemFinalStart).split('\n').length
+
+  return { text: result, line, refs: refEdits.length }
 }
 
 /** Заменяет прокси в config.yaml новым сгенерированным блоком, опционально переименовывая ссылки на него */
@@ -394,7 +433,7 @@ export function replaceMihomoProxy(text: string, oldName: string, item: string, 
     throw new Error('Замена прокси в flow-стиле не поддерживается')
   }
 
-  const declaredAnchors = collectAnchorNames(targetItem)
+  const declaredAnchors = collectAnchorNamesIn(targetItem)
   if (declaredAnchors.size > 0) {
     const aliasesOutside = collectAliasSourcesOutside(doc, itemRange)
     for (const anchor of declaredAnchors) {
@@ -440,13 +479,6 @@ export function replaceMihomoProxy(text: string, oldName: string, item: string, 
   }
 
   const itemStart = itemRange[0]
-  // itemRange[1] обычно уже включает собственный завершающий \n элемента (или доходит до EOF).
-  // Если нет (например, значение заканчивается серединой строки) — дотягиваем до конца строки с \n.
-  let regionEnd = itemRange[1]
-  if (regionEnd < text.length && text[regionEnd - 1] !== '\n') {
-    const nlAfter = text.indexOf('\n', regionEnd)
-    regionEnd = nlAfter === -1 ? text.length : nlAfter + 1
-  }
   let dashIdx = itemStart - 1
   while (dashIdx >= 0 && (text[dashIdx] === ' ' || text[dashIdx] === '\t' || text[dashIdx] === '\n' || text[dashIdx] === '\r')) dashIdx--
   if (dashIdx < 0 || text[dashIdx] !== '-') {
@@ -459,29 +491,178 @@ export function replaceMihomoProxy(text: string, oldName: string, item: string, 
   const raw = block.replace(/\n+$/, '')
   const insertion = `${reindent(raw, shift)}\n`
 
-  const refEdits: Edit[] = []
-  if (renameRefs && name !== oldName) {
-    for (const edit of collectReferenceEdits(root, oldName, name)) {
-      if (edit.start < regionEnd && edit.end > lineStart) continue
-      refEdits.push(edit)
+  const candidateRefEdits = renameRefs && name !== oldName ? collectReferenceEdits(root, oldName, name) : []
+  const spliced = spliceRegion(text, lineStart, itemRange[1], insertion, candidateRefEdits)
+
+  return { text: spliced.text, name, line: spliced.line, refs: spliced.refs }
+}
+
+/** Ключи top-level секции proxy-providers, в порядке следования. Никогда не бросает исключений. */
+export function listMihomoProviders(text: string): string[] {
+  try {
+    const doc = parseDocument(text)
+    if (doc.errors.length) return []
+    const root = doc.contents
+    if (!isMap(root)) return []
+    const providers = root.get('proxy-providers', true)
+    if (!isMap(providers)) return []
+    const names: string[] = []
+    const seen = new Set<string>()
+    for (const pair of providers.items) {
+      const key = pair.key
+      if (isScalar(key) && typeof key.value === 'string' && !seen.has(key.value)) {
+        seen.add(key.value)
+        names.push(key.value)
+      }
+    }
+    return names
+  } catch {
+    return []
+  }
+}
+
+/** Ключ сгенерированного блока провайдера (единственная пара верхнего уровня) */
+export function providerEntryName(entry: string): string | null {
+  try {
+    const doc = parseDocument(entry)
+    if (doc.errors.length) return null
+    const map = doc.contents
+    if (!isMap(map) || map.items.length !== 1) return null
+    const key = map.items[0].key
+    if (isScalar(key) && typeof key.value === 'string') return key.value
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** Возвращает сгенерированный блок провайдера с изменённым ключом; остальное побайтово идентично.
+ * Ключ квотируется только когда это необходимо (isPlainSafe), в отличие от withProxyName, которая
+ * всегда оборачивает имя в одинарные кавычки — формат вставки у прокси и провайдера разный. */
+export function withProviderName(entry: string, name: string): string {
+  try {
+    const doc = parseDocument(entry)
+    if (doc.errors.length) return entry
+    const map = doc.contents
+    if (!isMap(map) || map.items.length !== 1) return entry
+    const key = map.items[0].key
+    if (!isScalar(key) || !key.range) return entry
+    const [start, end] = key.range
+    const newKey = isPlainSafe(name, false) ? name : quoteSingle(name)
+    return entry.slice(0, start) + newKey + entry.slice(end)
+  } catch {
+    return entry
+  }
+}
+
+/** Собирает правки переименования ссылок на провайдера: только proxy-groups[].use[] (block и flow) */
+function collectProviderReferenceEdits(root: YAMLMap, oldName: string, newName: string): Edit[] {
+  const edits: Edit[] = []
+  const groups = root.get('proxy-groups', true)
+  if (isSeq(groups)) {
+    for (const g of groups.items) {
+      if (!isMap(g)) continue
+      const use = g.get('use', true)
+      if (isSeq(use)) {
+        for (const el of use.items) pushWholeValueEdit(edits, el, oldName, newName, Boolean(use.flow))
+      }
+    }
+  }
+  return edits
+}
+
+/** Заменяет провайдера в config.yaml новым сгенерированным блоком, опционально переименовывая ссылки на него */
+export function replaceMihomoProvider(
+  text: string,
+  oldName: string,
+  entry: string,
+  opts: { renameRefs: boolean }
+): ReplaceProxyResult {
+  const doc = parseDocument(text)
+  if (doc.errors.length) {
+    throw new Error(`Не удалось разобрать config.yaml: ${doc.errors[0].message}`)
+  }
+
+  const notFound = () => new Error(`Провайдер «${oldName}» не найден в config.yaml`)
+  const root = doc.contents
+  if (!isMap(root)) throw notFound()
+  const providers = root.get('proxy-providers', true)
+  if (!isMap(providers)) throw notFound()
+
+  const targetPair = providers.items.find((p) => isScalar(p.key) && String(p.key.value) === oldName)
+  if (!targetPair) throw notFound()
+
+  const targetValue = targetPair.value
+  if (providers.flow || (isMap(targetValue) && targetValue.flow)) {
+    throw new Error('Замена провайдера в flow-стиле не поддерживается')
+  }
+
+  const keyNode = targetPair.key
+  if (!isScalar(keyNode) || !keyNode.range) throw notFound()
+  const keyRange = keyNode.range
+  const valueRange =
+    targetValue !== null && targetValue !== undefined && typeof targetValue === 'object' && 'range' in targetValue
+      ? (targetValue as { range?: readonly [number, number, ...number[]] }).range
+      : undefined
+  const pairEnd = valueRange ? valueRange[1] : keyRange[1]
+  const pairRange: readonly [number, number] = [keyRange[0], pairEnd]
+
+  const declaredAnchors = new Set<string>([
+    ...collectAnchorNamesIn(keyNode),
+    ...collectAnchorNamesIn(targetValue as Node | null | undefined),
+  ])
+  if (declaredAnchors.size > 0) {
+    const aliasesOutside = collectAliasSourcesOutside(doc, pairRange)
+    for (const anchor of declaredAnchors) {
+      if (aliasesOutside.has(anchor)) {
+        throw new Error(`Провайдер «${oldName}» объявляет якорь &${anchor}, который используется в другом месте конфига`)
+      }
     }
   }
 
-  const edits: Edit[] = [...refEdits, { start: lineStart, end: regionEnd, text: insertion, isItem: true }]
-  edits.sort((a, b) => a.start - b.start)
-
-  let result = ''
-  let cursor = 0
-  let itemFinalStart = -1
-  for (const edit of edits) {
-    result += text.slice(cursor, edit.start)
-    if (edit.isItem) itemFinalStart = result.length
-    result += edit.text
-    cursor = edit.end
+  const invalidEntry = () => new Error('Сгенерированный провайдер не является корректным YAML')
+  const { renameRefs } = opts
+  let name: string
+  let block: string
+  if (renameRefs) {
+    const parsedName = providerEntryName(entry)
+    if (parsedName === null) throw invalidEntry()
+    name = parsedName
+    // Нормализуем ключ через ту же логику квотирования, что и withProviderName, а не берём
+    // сырой entry: генератор (toYaml) эмитит ключ как plain-текст без учёта YAML 1.1
+    // bool/null-подобных токенов ("yes", "no", "on", "off", …) и спецсимволов ("#", ": ").
+    block = withProviderName(entry, name)
+    if (providerEntryName(block) !== name) throw invalidEntry()
+  } else {
+    name = oldName
+    block = withProviderName(entry, oldName)
+    if (providerEntryName(block) !== oldName) throw invalidEntry()
   }
-  result += text.slice(cursor)
 
-  const line = result.slice(0, itemFinalStart).split('\n').length
+  if (renameRefs && name !== oldName) {
+    const otherNames = new Set<string>()
+    for (const pair of providers.items) {
+      if (pair === targetPair) continue
+      if (isScalar(pair.key) && typeof pair.key.value === 'string') otherNames.add(pair.key.value)
+    }
+    if (otherNames.has(name)) {
+      throw new Error(`Имя «${name}» уже используется в конфиге`)
+    }
+  }
 
-  return { text: result, name, line, refs: refEdits.length }
+  const lineStart = text.lastIndexOf('\n', keyRange[0]) + 1
+  const keyColumn = keyRange[0] - lineStart
+
+  const raw = block.replace(/\n+$/, '')
+  // Колонка ключа в сгенерированном блоке не всегда 2: не полагаемся на фиксированный отступ
+  // генератора, а вычисляем её по первой строке блока (первый непробельный символ).
+  const entryFirstLine = raw.split('\n', 1)[0]
+  const entryKeyColumn = entryFirstLine.length - entryFirstLine.trimStart().length
+  const shift = keyColumn - entryKeyColumn
+  const insertion = `${reindent(raw, shift)}\n`
+
+  const candidateRefEdits = renameRefs && name !== oldName ? collectProviderReferenceEdits(root, oldName, name) : []
+  const spliced = spliceRegion(text, lineStart, pairEnd, insertion, candidateRefEdits)
+
+  return { text: spliced.text, name, line: spliced.line, refs: spliced.refs }
 }

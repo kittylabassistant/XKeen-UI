@@ -8,7 +8,7 @@ import { StatusBar } from './components/status/StatusBar'
 import { Toast } from './components/ui/toast'
 import { apiCall, capitalize } from './lib/api'
 import { LazyBoundary, lazyLoad, useLazyMount } from './lib/loader'
-import { listMihomoTakenNames, replaceMihomoProxy } from './lib/mihomoReplace'
+import { listMihomoTakenNames, replaceMihomoProvider, replaceMihomoProxy } from './lib/mihomoReplace'
 import { fetchClashProxies, getAppState, syncClashApiPort, useAppActions, useModalContext, useSettings } from './lib/store'
 import { applyTheme, THEME_MEDIA_QUERY } from './lib/theme'
 import { DEFAULT_PING_TEST_TIMEOUT, DEFAULT_PING_TEST_URL, type Config, type ThemeMode } from './lib/types'
@@ -42,7 +42,7 @@ interface ModalManagerProps {
   onInstalled: () => void
   onGenerate: (uri: string, excludeName?: string) => { content: string; type: string } | null
   onAddToConfig: (content: string, type: string, position: 'start' | 'end') => void
-  onReplaceProxy: (content: string, oldName: string, renameRefs: boolean) => void
+  onReplace: (kind: 'proxy' | 'provider', content: string, oldName: string, renameRefs: boolean) => void
   onImportTemplate: (url: string) => Promise<void>
   openModal: (modal: string) => void
 }
@@ -52,7 +52,7 @@ const ModalManager = memo(function ModalManager({
   onInstalled,
   onGenerate,
   onAddToConfig,
-  onReplaceProxy,
+  onReplace,
   onImportTemplate,
   openModal,
 }: ModalManagerProps) {
@@ -92,7 +92,7 @@ const ModalManager = memo(function ModalManager({
       )}
       {mountImport && (
         <LazyBoundary>
-          <ImportModal onGenerate={onGenerate} onAddToConfig={onAddToConfig} onReplaceProxy={onReplaceProxy} />
+          <ImportModal onGenerate={onGenerate} onAddToConfig={onAddToConfig} onReplace={onReplace} />
         </LazyBoundary>
       )}
       {mountAmneziaImport && (
@@ -448,8 +448,8 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
     [showToast]
   )
 
-  const replaceProxy = useCallback(
-    (content: string, oldName: string, renameRefs: boolean) => {
+  const onReplace = useCallback(
+    (kind: 'proxy' | 'provider', content: string, oldName: string, renameRefs: boolean) => {
       const appState = getAppState()
       const targetIndex = appState.configs.findIndex((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')
 
@@ -465,13 +465,17 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         if (!editorWrapper) return
         try {
           const buffer = editorWrapper.getValue()
-          const res = replaceMihomoProxy(buffer, oldName, content, { renameRefs })
+          const res =
+            kind === 'proxy'
+              ? replaceMihomoProxy(buffer, oldName, content, { renameRefs })
+              : replaceMihomoProvider(buffer, oldName, content, { renameRefs })
           editorWrapper.replaceAll(res.text)
           setTimeout(() => editorWrapper.revealLine(res.line), 0)
+          const label = kind === 'proxy' ? 'Прокси' : 'Провайдер'
           const message =
             res.name !== oldName
-              ? `Прокси «${oldName}» заменён на «${res.name}»${res.refs > 0 ? `, обновлено ссылок: ${res.refs}` : ''}`
-              : `Прокси «${oldName}» заменён`
+              ? `${label} «${oldName}» заменён на «${res.name}»${res.refs > 0 ? `, обновлено ссылок: ${res.refs}` : ''}`
+              : `${label} «${oldName}» заменён`
           showToast(message)
         } catch (e: any) {
           showToast(e.message, 'error')
@@ -521,7 +525,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         onInstalled={onInstalled}
         onGenerate={generateConfig}
         onAddToConfig={addToConfig}
-        onReplaceProxy={replaceProxy}
+        onReplace={onReplace}
         onImportTemplate={importTemplate}
         openModal={openModal}
       />
