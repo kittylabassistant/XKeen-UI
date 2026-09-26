@@ -1,5 +1,6 @@
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Combobox, ComboboxContent, ComboboxEmpty, ComboboxInput, ComboboxItem, ComboboxList } from '@/components/ui/combobox'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -8,8 +9,9 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { copyText } from '@/lib/utils'
-import { IconCheck, IconCopy, IconLink, IconPlus, IconRefresh, IconX } from '@tabler/icons-react'
-import { useState } from 'react'
+import { IconCheck, IconCopy, IconLink, IconPlus, IconRefresh, IconReplace, IconX } from '@tabler/icons-react'
+import { useMemo, useState } from 'react'
+import { listMihomoProxies, proxyItemName, withProxyName } from '../../lib/mihomoReplace'
 import { useAppContext, useModalContext } from '../../lib/store'
 import { InputGroup, InputGroupAddon, InputGroupInput } from '../ui/input-group'
 import { SelectGroup } from '@/components/ui/select'
@@ -195,11 +197,12 @@ function createDefaultForm(url: string, existingConfig: string): SubscriptionFor
 }
 
 interface Props {
-  onGenerate: (uri: string) => { content: string; type: string } | null
+  onGenerate: (uri: string, excludeName?: string) => { content: string; type: string } | null
   onAddToConfig: (content: string, type: string, position: 'start' | 'end') => void
+  onReplaceProxy: (content: string, oldName: string, renameRefs: boolean) => void
 }
 
-export function ImportModal({ onGenerate, onAddToConfig }: Props) {
+export function ImportModal({ onGenerate, onAddToConfig, onReplaceProxy }: Props) {
   const { showToast, state } = useAppContext({ includeConfigs: true })
   const { modals, dispatch } = useModalContext()
   const [uri, setUri] = useState('')
@@ -210,6 +213,10 @@ export function ImportModal({ onGenerate, onAddToConfig }: Props) {
   const [isCustomUA, setIsCustomUA] = useState(false)
   const [customUA, setCustomUA] = useState('')
   const [generated, setGenerated] = useState(false)
+  const [resultUri, setResultUri] = useState<string | null>(null)
+  const [replaceOpen, setReplaceOpen] = useState(false)
+  const [replaceTarget, setReplaceTarget] = useState<string | null>(null)
+  const [renameRefs, setRenameRefs] = useState(true)
 
   const isValidUri = SUPPORTED_PROTOCOLS.some((p) => {
     if (state.currentCore !== 'mihomo' && (p === 'http://' || p === 'https://')) return false
@@ -221,22 +228,30 @@ export function ImportModal({ onGenerate, onAddToConfig }: Props) {
     setTimeout(() => {
       setUri('')
       setResult(null)
+      setResultUri(null)
       setSubForm(null)
       setIsCustomUA(false)
       setCustomUA('')
       setGenerated(false)
+      setReplaceOpen(false)
+      setReplaceTarget(null)
+      setRenameRefs(true)
     }, 300)
   }
 
   function generate() {
     if (!uri.trim()) return
     const trimmed = uri.trim()
+    setReplaceOpen(false)
+    setReplaceTarget(null)
+    setRenameRefs(true)
 
     if (/^https?:\/\//i.test(trimmed)) {
       const existingContent = state.configs.find((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')?.content ?? ''
       const form = createDefaultForm(trimmed, existingContent)
       setSubForm(form)
       setResult({ content: '', type: 'proxy-provider', protocol: 'HTTP' })
+      setResultUri(null)
       setSubTab('form')
       setGenerated(true)
       return
@@ -247,14 +262,46 @@ export function ImportModal({ onGenerate, onAddToConfig }: Props) {
       if (generated) {
         const protocol = trimmed.match(/^([a-zA-Z0-9+\-.]+):\/\//)?.[1]?.toUpperCase() ?? ''
         setResult({ ...generated, protocol })
+        setResultUri(trimmed)
         setSubForm(null)
       } else {
         setResult(null)
+        setResultUri(null)
         setSubForm(null)
       }
     } catch (e: any) {
       showToast(e.message, 'error')
     }
+  }
+
+  function regenerateResult(excludeName?: string) {
+    if (!resultUri) return
+    try {
+      const next = onGenerate(resultUri, excludeName)
+      if (next) setResult((prev) => ({ ...next, protocol: prev?.protocol ?? '' }))
+    } catch (e: any) {
+      showToast(e.message, 'error')
+    }
+  }
+
+  function toggleReplace() {
+    const next = !replaceOpen
+    setReplaceOpen(next)
+    if (!next && replaceTarget) {
+      setReplaceTarget(null)
+      regenerateResult()
+    }
+  }
+
+  function selectReplaceTarget(target: string | null) {
+    setReplaceTarget(target)
+    regenerateResult(target ?? undefined)
+  }
+
+  function confirmReplace() {
+    if (!result || !replaceTarget || (renameRefs && !newProxyName)) return
+    onReplaceProxy(previewContent, replaceTarget, renameRefs)
+    close()
   }
 
   function updateSubField<K extends keyof SubscriptionForm>(key: K, value: SubscriptionForm[K]) {
@@ -302,6 +349,15 @@ export function ImportModal({ onGenerate, onAddToConfig }: Props) {
   }
 
   const showSubForm = generated && subForm && result
+  const isMihomoProxyFlow = state.currentCore === 'mihomo' && result?.type === 'proxy'
+  const configYamlContent = state.configs.find((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')?.content ?? ''
+  const mihomoProxies = useMemo(
+    () => (isMihomoProxyFlow ? listMihomoProxies(configYamlContent) : []),
+    [isMihomoProxyFlow, configYamlContent]
+  )
+  const newProxyName = result ? proxyItemName(result.content) : null
+  const previewContent =
+    result && replaceTarget ? (renameRefs ? result.content : withProxyName(result.content, replaceTarget)) : (result?.content ?? '')
 
   return (
     <TooltipProvider delayDuration={500}>
@@ -595,19 +651,93 @@ export function ImportModal({ onGenerate, onAddToConfig }: Props) {
                   <pre
                     className="m-0 p-3 font-mono text-[13px] tracking-tight"
                     dangerouslySetInnerHTML={{
-                      __html: highlightCode(result.content),
+                      __html: highlightCode(previewContent),
                     }}
                   />
                 </div>
 
                 <div className="border-border bg-muted/10 flex w-full shrink-0 gap-2 border-t p-2">
-                  <Button variant="outline" size="sm" className="flex-1 gap-1.5 text-xs" onClick={() => addToConfig('start')}>
-                    <IconPlus /> В начало
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
+                    onClick={() => addToConfig('start')}
+                  >
+                    <IconPlus /> <span className="truncate">В начало</span>
                   </Button>
-                  <Button variant="outline" size="sm" className="flex-1 gap-1.5 text-xs" onClick={() => addToConfig('end')}>
-                    <IconPlus /> В конец
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
+                    onClick={() => addToConfig('end')}
+                  >
+                    <IconPlus /> <span className="truncate">В конец</span>
                   </Button>
+                  {isMihomoProxyFlow && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="min-w-0 flex-1 shrink gap-1.5 px-1.5 text-xs max-sm:[&_svg]:hidden sm:px-2.5"
+                      onClick={toggleReplace}
+                    >
+                      <IconReplace /> <span className="truncate">Заменить…</span>
+                    </Button>
+                  )}
                 </div>
+
+                {isMihomoProxyFlow && replaceOpen && (
+                  <div className="border-border bg-muted/10 flex w-full shrink-0 flex-col gap-3 border-t p-3">
+                    <div className="grid gap-1.5">
+                      <Label className="text-xs">Прокси для замены</Label>
+                      <Combobox
+                        items={mihomoProxies}
+                        value={replaceTarget}
+                        itemToStringLabel={(item) => item}
+                        itemToStringValue={(item) => item}
+                        onValueChange={selectReplaceTarget}
+                        autoHighlight
+                      >
+                        <ComboboxInput fullWidth placeholder="Выберите прокси" disabled={mihomoProxies.length === 0} />
+                        <ComboboxContent>
+                          <ComboboxEmpty>Ничего не найдено</ComboboxEmpty>
+                          <ComboboxList>
+                            {(item: string) => (
+                              <ComboboxItem key={item} value={item}>
+                                {item}
+                              </ComboboxItem>
+                            )}
+                          </ComboboxList>
+                        </ComboboxContent>
+                      </Combobox>
+                      {mihomoProxies.length === 0 && <p className="text-muted-foreground text-xs">В config.yaml нет прокси</p>}
+                    </div>
+
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="grid gap-0.5">
+                        <Label className="text-xs">Переименовать ссылки во всём конфиге</Label>
+                        {replaceTarget && (
+                          <p className="text-muted-foreground text-xs">
+                            {renameRefs
+                              ? newProxyName
+                                ? `Ссылки на «${replaceTarget}» в группах, правилах, dialer-proxy и DNS станут «${newProxyName}»`
+                                : 'Не удалось определить имя нового прокси'
+                              : `Новый прокси получит имя «${replaceTarget}», ссылки не изменятся`}
+                          </p>
+                        )}
+                      </div>
+                      <Switch size="sm" checked={renameRefs} onCheckedChange={(v) => setRenameRefs(v)} />
+                    </div>
+
+                    <Button
+                      size="sm"
+                      className="w-full"
+                      disabled={!replaceTarget || (renameRefs && !newProxyName)}
+                      onClick={confirmReplace}
+                    >
+                      Заменить
+                    </Button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -628,7 +758,11 @@ export function ImportModal({ onGenerate, onAddToConfig }: Props) {
                       onClick={() => {
                         setUri('')
                         setResult(null)
+                        setResultUri(null)
                         setSubForm(null)
+                        setReplaceOpen(false)
+                        setReplaceTarget(null)
+                        setRenameRefs(true)
                       }}
                       className="text-muted-foreground hover:text-destructive hover:bg-transparent!"
                     >
