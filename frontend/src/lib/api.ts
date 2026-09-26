@@ -23,25 +23,32 @@ export async function apiCall<T = unknown>(method: string, endpoint: string, bod
   return (await res.json()) as T
 }
 
-export async function clashFetch<T = unknown>(
-  port: string,
-  path: string,
-  options?: { method?: string; secret?: string | null; body?: unknown; unix?: string | null; retry?: boolean }
-): Promise<T> {
-  const { method = 'GET', secret, body, unix, retry = true } = options ?? {}
-  const canRetry = retry && method === 'GET'
-  const normalizedPath = path.replace(/^\/+/, '')
-
+/** Builds the X-Clash-Port/Secret/Unix headers used to route requests to the active Clash API instance. */
+export function buildClashHeaders(port?: string | null, secret?: string | null, unix?: string | null): Record<string, string> {
   const headers: Record<string, string> = {}
   if (!unix && port) headers['X-Clash-Port'] = port
   if (!unix && secret) headers['X-Clash-Secret'] = secret
   if (unix) headers['X-Clash-Unix'] = unix
+  return headers
+}
+
+export async function clashFetch<T = unknown>(
+  port: string,
+  path: string,
+  options?: { method?: string; secret?: string | null; body?: unknown; unix?: string | null; retry?: boolean; signal?: AbortSignal }
+): Promise<T> {
+  const { method = 'GET', secret, body, unix, retry = true, signal } = options ?? {}
+  const canRetry = retry && method === 'GET'
+  const normalizedPath = path.replace(/^\/+/, '')
+
+  const headers: Record<string, string> = buildClashHeaders(port, secret, unix)
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   const reqOptions: RequestInit = {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   }
 
   const maxAttempts = canRetry ? RETRY_DELAYS.length : 0

@@ -115,6 +115,7 @@ export interface AppState {
   showSettingsModal: boolean
   showCommentsWarningModal: boolean
   showGeoScanModal: boolean
+  showRouteTestModal: boolean
   showBackupsModal: boolean
   updateModalCore: string
   toasts: ToastMessage[]
@@ -151,6 +152,7 @@ export type AppAction =
       | 'showSettingsModal'
       | 'showCommentsWarningModal'
       | 'showGeoScanModal'
+      | 'showRouteTestModal'
       | 'showBackupsModal'
     >
     show: boolean
